@@ -1,0 +1,54 @@
+# Reference configuration. Override any key from the CLI with OmegaConf dotlist syntax:
+#   python scripts/train.py --config configs/default.yaml train.lr=1e-4 model.top_k=2
+model:
+  experts:            # any HF Llama-style decoder (Llama, Mistral, Qwen2/3, Gemma, ...); fast tokenizer required
+    - name: mistralai/Mistral-7B-v0.1
+    - name: meta-math/MetaMath-Mistral-7B
+    - name: meta-llama/Meta-Llama-3-8B
+  top_k: 2
+  router:
+    encoder: microsoft/deberta-v3-base
+    encoder_max_length: 512
+    hidden_size: 768
+    temperature: 1.0
+    dropout: 0.1
+    gumbel_noise: true           # Gumbel-perturbed top-K during training (straight-through estimator)
+  interaction:
+    num_layers: 8                # Q: number of interaction layers / stacks
+    shared_dim: 2048             # d_s
+    num_heads: 8
+    dropout: 0.1
+    placement: uniform           # uniform | shallow | intermediate | deep
+    cross_attention: true        # false -> "MoT w/o CrossAttn" ablation (projectors only)
+  dtype: bfloat16
+  attn_implementation: kernels-community/flash-attn3   # FlashAttention-3 via HF hub kernels (H100/H200); falls back to sdpa
+  devices: null                  # null -> round-robin experts over all visible GPUs
+  main_device: cuda:0            # router, prompt encoder and interaction layers live here
+  gradient_checkpointing: true
+
+train:
+  data: data/train.jsonl         # {"prompt", "completion", "expert_scores": [M floats] (optional)}
+  output_dir: runs/default
+  epochs: 3
+  batch_size: 16
+  lr: 5e-5
+  weight_decay: 0.01
+  warmup_steps: 500
+  grad_clip: 1.0
+  max_length: 512
+  seed: 42
+  log_every: 10
+  save_every: 1000
+  num_workers: 4
+  resume: null
+  loss:
+    routing: ce                  # ce | bce | none  (supervised router loss on expert_scores)
+    routing_weight: 1.0
+
+generation:
+  max_prompt_length: 2048
+  max_new_tokens: 256
+  temperature: 0.2
+  top_p: 0.9
+  do_sample: true
+  batch_size: 16
