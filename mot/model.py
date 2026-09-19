@@ -14,7 +14,7 @@ from transformers.generation import LogitsProcessorList, TemperatureLogitsWarper
 from mot.config import GenerationConfig, LossConfig, ModelConfig
 from mot.experts import PAD_TIME, ExpertBatch, ExpertPool, build_batches
 from mot.interaction import InteractionCache, InteractionLayer
-from mot.losses import lm_loss, routing_loss
+from mot.losses import lm_loss, routing_loss, supervised_positions
 from mot.routing import PromptEncoder, Router, RoutingDecision
 
 WEIGHTS_FILE = "mot.safetensors"
@@ -45,7 +45,8 @@ class MixtureOfThoughts(nn.Module):
         self.cfg = cfg
         self.pool = pool if pool is not None else ExpertPool.from_config(cfg)
         self.main_device = torch.device(cfg.main_device if torch.cuda.is_available() else "cpu")
-        self.encoder = PromptEncoder(cfg.router.encoder, cfg.router.encoder_max_length, self.main_device)
+        encoder_dtype = getattr(torch, cfg.dtype) if self.main_device.type == "cuda" else torch.float32
+        self.encoder = PromptEncoder(cfg.router.encoder, cfg.router.encoder_max_length, self.main_device, encoder_dtype)
         self.router = Router(
             self.encoder.output_dim,
             cfg.router.hidden_size,
@@ -54,12 +55,8 @@ class MixtureOfThoughts(nn.Module):
             cfg.router.temperature,
             cfg.router.dropout,
         ).to(self.main_device)
-        ia = cfg.interaction
         self.interactions = nn.ModuleList(
-            InteractionLayer(
-                self.pool.hidden_sizes, ia.shared_dim, ia.num_heads, cfg.top_k, ia.dropout, ia.cross_attention
-            )
-            for _ in range(ia.num_layers)
+            InteractionLayer(self.pool.hidden_sizes, cfg.interaction, cfg.top_k) for _ in range(cfg.interaction.num_layers)
         ).to(self.main_device)
         self.pool.set_gradient_checkpointing(cfg.gradient_checkpointing)
 
@@ -115,9 +112,12 @@ class MixtureOfThoughts(nn.Module):
         batches: dict[int, ExpertBatch],
         gate: Tensor,
         kv_caches: dict[int, Cache] | None = None,
-        ia_caches: list[InteractionCache] | None = None,
+        ia_caches: list[list[InteractionCache]] | None = None,
+        tail_rows: dict[int, Tensor] | None = None,
     ) -> dict[int, Tensor]:
-        """Advance every active expert stream through all segments, interleaving interaction layers."""
+        """Advance every active expert stream through all segments, interleaving interaction layers (each
+        applied `loops` times; `ia_caches[q][i]` caches layer q, pass i). `tail_rows[m]` (CPU long indices)
+        restricts the final segment to those rows; experts with no rows are dropped from the result."""
         states = {}
         for m, inp in step.items():
             expert = self.pool[m]
@@ -132,22 +132,53 @@ class MixtureOfThoughts(nn.Module):
         for q, layer in enumerate(self.interactions):
             hiddens = {m: self.pool[m].run_segment(states[m], q) for m in states}
             with self._autocast():
-                updated = layer(hiddens, batches, times, gate, ia_caches[q] if ia_caches is not None else None)
+                for i in range(layer.loops):
+                    cache = ia_caches[q][i] if ia_caches is not None else None
+                    hiddens = layer(hiddens, batches, times, gate, cache, loop=i)
             for m, state in states.items():
-                state.hidden = updated[m]
+                state.hidden = hiddens[m]
         tail = len(self.interactions)
-        return {m: self.pool[m].run_segment(states[m], tail) for m in states}
+        out = {}
+        for m, state in states.items():
+            expert = self.pool[m]
+            if tail_rows is None:
+                out[m] = expert.run_segment(state, tail)
+                continue
+            rows = tail_rows[m]
+            if rows.numel() == 0:
+                continue
+            rows = rows.to(expert.device)
+            sub = expert.select_rows(state, rows)
+            out[m] = expert.run_segment(sub, tail) if sub is not None else expert.run_segment(state, tail)[rows]
+        return out
 
-    def _teacher_forced(self, batches: dict[int, ExpertBatch], gate: Tensor) -> tuple[dict[int, Tensor], dict[int, Tensor]]:
+    def _teacher_forced(
+        self, batches: dict[int, ExpertBatch], gate: Tensor, with_peers: bool
+    ) -> tuple[dict[int, tuple[nn.Module, Tensor, Tensor]], dict[int, tuple[nn.Module, Tensor, Tensor]]]:
+        """Run all streams; return (lm_head, normed states, targets) at supervised positions for the primary
+        streams and, if `with_peers`, for the peer streams. Without peers the peers' tail layers are skipped."""
         step = {m: StepInputs(b.input_ids, b.attention_mask, b.position_ids, b.time) for m, b in batches.items()}
-        hidden = self._run_stacks(step, batches, gate)
-        logits, labels = {}, {}
+        tail_rows = None if with_peers else {m: b.primary_ids() for m, b in batches.items()}
+        hidden = self._run_stacks(step, batches, gate, tail_rows=tail_rows)
+
+        def head(m: int, h: Tensor, labels: Tensor):
+            expert = self.pool[m]
+            states, targets = supervised_positions(h, labels)
+            return expert.lm_head, expert.norm(states), targets
+
+        primary, peers = {}, {}
         for m, h in hidden.items():
-            primary = batches[m].primary_rows
-            if primary.any():
-                logits[m] = self.pool[m].logits(h[primary.to(h.device)])
-                labels[m] = batches[m].labels[primary].to(logits[m].device)
-        return logits, labels
+            b = batches[m]
+            p_idx = b.primary_ids()
+            if with_peers:
+                if p_idx.numel():
+                    primary[m] = head(m, h[p_idx.to(h.device)], b.labels[p_idx.to(b.labels.device)])
+                q_idx = b.peer_ids()
+                if q_idx.numel():
+                    peers[m] = head(m, h[q_idx.to(h.device)], b.labels[q_idx.to(b.labels.device)])
+            else:
+                primary[m] = head(m, h, b.labels[p_idx.to(b.labels.device)])
+        return primary, peers
 
     def forward(
         self,
@@ -165,10 +196,14 @@ class MixtureOfThoughts(nn.Module):
             scores, noisy=self.training and self.cfg.router.gumbel_noise, straight_through=self.training
         )
         batches = self._batches(decision.active, prompts, completions, max_length, "right", add_eos=True)
-        logits, labels = self._teacher_forced(batches, decision.gate)
+        with_peers = w.peer_lm_weight > 0 and self.cfg.top_k > 1
+        primary, peers = self._teacher_forced(batches, decision.gate, with_peers)
 
-        out = {"lm": lm_loss(logits, labels).to(self.main_device)}
+        out = {"lm": lm_loss(primary, w.lm_chunk_size, w.fused_ce, self.main_device)}
         total = out["lm"]
+        if peers:
+            out["peer_lm"] = lm_loss(peers, w.lm_chunk_size, w.fused_ce, self.main_device)
+            total = total + w.peer_lm_weight * out["peer_lm"]
         if expert_targets is not None and w.routing != "none":
             out["routing"] = routing_loss(scores, expert_targets, w.routing)
             total = total + w.routing_weight * out["routing"]
@@ -201,7 +236,9 @@ class MixtureOfThoughts(nn.Module):
         warpers = self._warpers(gen)
 
         kv_caches = {m: self.pool[m].new_cache() for m in batches}
-        ia_caches = [InteractionCache() for _ in self.interactions] if self.cfg.interaction.cross_attention else None
+        ia_caches = None
+        if self.cfg.interaction.cross_attention:
+            ia_caches = [[InteractionCache() for _ in range(layer.loops)] for layer in self.interactions]
         step = {m: StepInputs(b.input_ids, b.attention_mask, b.position_ids, b.time) for m, b in batches.items()}
         hidden = self._run_stacks(step, batches, decision.gate, kv_caches, ia_caches)
 
@@ -217,7 +254,7 @@ class MixtureOfThoughts(nn.Module):
             tokens = {}
             for m, h in hidden.items():
                 expert, b = self.pool[m], batches[m]
-                nxt = self._sample(expert.logits(h[:, -1]), warpers).to(dev)
+                nxt = self._sample(expert.logits(h[:, -1]), warpers).to(dev, non_blocking=True)
                 nxt = torch.where(alive[m], nxt, torch.full_like(nxt, expert.pad_token_id))
                 is_eos = nxt == expert.eos_token_id
                 primary = b.primary_rows
@@ -226,15 +263,18 @@ class MixtureOfThoughts(nn.Module):
                 done[rows] |= is_eos[primary]
                 alive[m] &= ~is_eos
                 tokens[m] = nxt[:, None]
-            if done.all():
+            for m in hidden:
+                alive[m] &= ~done[batches[m].rows]
+            # single host sync per step: global stop flag + per-expert liveness
+            flags = torch.stack([done.all(), *(alive[m].any() for m in hidden)]).tolist()
+            if flags[0]:
                 break
 
             step = {}
-            for m in hidden:
-                b = batches[m]
-                alive[m] &= ~done[b.rows]
-                if not alive[m].any():
+            for m, live in zip(hidden, flags[1:]):
+                if not live:
                     continue
+                b = batches[m]
                 attn_mask[m] = torch.cat([attn_mask[m], torch.ones_like(alive[m][:, None], dtype=attn_mask[m].dtype)], -1)
                 time = torch.where(alive[m], base_time[b.rows] + 1 + t, torch.full_like(base_time[b.rows], PAD_TIME))
                 step[m] = StepInputs(tokens[m], attn_mask[m], next_pos[m][:, None], time[:, None])

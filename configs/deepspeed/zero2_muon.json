@@ -1,0 +1,19 @@
+{
+  "optimizer": {
+    "type": "Muon",
+    "params": {
+      "lr": "auto",
+      "momentum": 0.95,
+      "weight_decay": "auto",
+      "ns_method": "gram"
+    }
+  },
+  "zero_optimization": {
+    "stage": 2,
+    "overlap_comm": true,
+    "contiguous_gradients": true,
+    "reduce_bucket_size": 5e7
+  },
+  "comms_logger": { "enabled": false },
+  "wall_clock_breakdown": false
+}

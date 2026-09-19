@@ -35,8 +35,28 @@ def test_train_step_bf16(gpu_model):
     out = gpu_model(PROMPTS, COMPLETIONS, max_length=64, expert_targets=targets, loss_weights=LossConfig())
     assert torch.isfinite(out["loss"])
     out["loss"].backward()
-    assert all(p.grad is not None and torch.isfinite(p.grad).all() for p in gpu_model.trainable_parameters())
+    params = dict(gpu_model.trainable_modules().named_parameters())
+    assert all(torch.isfinite(p.grad).all() for p in params.values() if p.grad is not None)
+    assert params["router.mlp.0.weight"].grad is not None
+    for m in set(out["active"].flatten().tolist()):
+        assert params[f"interactions.0.reverse_proj.{m}.weight"].grad is not None
     gpu_model.zero_grad(set_to_none=True)
+
+
+def test_muon_step_bf16(gpu_model):
+    from mot.config import OptimConfig
+    from mot.optim import build_optimizer
+
+    gpu_model.train()
+    opt = build_optimizer(gpu_model, OptimConfig(name="muon"), lr=1e-3, weight_decay=0.01)
+    before = [p.detach().clone() for p in gpu_model.trainable_parameters()]
+    out = gpu_model(PROMPTS, COMPLETIONS, max_length=64)
+    out["loss"].backward()
+    opt.step()
+    opt.zero_grad(set_to_none=True)
+    after = list(gpu_model.trainable_parameters())
+    assert all(torch.isfinite(p).all() for p in after)
+    assert any(not torch.equal(a, b) for a, b in zip(before, after))
 
 
 def test_generate_bf16(gpu_model):

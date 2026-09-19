@@ -6,7 +6,7 @@ from pathlib import Path
 
 import torch
 from torch import Tensor
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, Sampler
 
 EXPERT_SCORES = "expert_scores"
 
@@ -45,6 +45,10 @@ class PromptCompletionDataset(Dataset):
     def __getitem__(self, i: int) -> dict:
         return self.rows[i]
 
+    @property
+    def lengths(self) -> list[int]:
+        return [len(r["prompt"]) + len(r["completion"]) for r in self.rows]
+
 
 def collate(rows: list[dict]) -> Batch:
     targets = None
@@ -53,19 +57,78 @@ def collate(rows: list[dict]) -> Batch:
     return Batch([r["prompt"] for r in rows], [r["completion"] for r in rows], targets)
 
 
+class LengthGroupedBatchSampler(Sampler[list[int]]):
+    """Rank-sharded batch sampler. Samples are shuffled, then sorted by length inside mega-batches of
+    `mega * batch_size` so each batch pads little; batch order is shuffled again. Every rank draws the same
+    permutation from `seed + epoch` and takes a disjoint stride of batches, so no communication is needed."""
+
+    def __init__(
+        self,
+        lengths: list[int],
+        batch_size: int,
+        shuffle: bool = True,
+        group_by_length: bool = True,
+        seed: int = 0,
+        rank: int = 0,
+        world_size: int = 1,
+        mega: int = 32,
+    ):
+        self.lengths = torch.tensor(lengths)
+        self.batch_size = batch_size
+        self.shuffle = shuffle
+        self.group_by_length = group_by_length
+        self.seed = seed
+        self.rank = rank
+        self.world_size = world_size
+        self.mega = mega
+        self.epoch = 0
+        total = len(lengths) // batch_size
+        self.num_batches = total // world_size
+
+    def set_epoch(self, epoch: int) -> None:
+        self.epoch = epoch
+
+    def __len__(self) -> int:
+        return self.num_batches
+
+    def __iter__(self):
+        n = len(self.lengths)
+        g = torch.Generator().manual_seed(self.seed + self.epoch)
+        idx = torch.randperm(n, generator=g) if self.shuffle else torch.arange(n)
+        if self.group_by_length:
+            chunks = []
+            for chunk in idx.split(self.mega * self.batch_size):
+                order = self.lengths[chunk].argsort(descending=True)
+                chunks.append(chunk[order])
+            idx = torch.cat(chunks)
+        batches = list(idx.split(self.batch_size))[: self.num_batches * self.world_size]
+        if self.shuffle:
+            order = torch.randperm(len(batches), generator=g).tolist()
+            batches = [batches[i] for i in order]
+        for b in batches[self.rank :: self.world_size]:
+            yield b.tolist()
+
+
 def make_loader(
     path: str | Path,
     batch_size: int,
     shuffle: bool,
     num_workers: int,
     num_experts: int | None = None,
-    drop_last: bool = True,
+    group_by_length: bool = True,
+    seed: int = 0,
+    rank: int = 0,
+    world_size: int = 1,
 ) -> DataLoader:
+    dataset = PromptCompletionDataset(path, num_experts)
+    sampler = LengthGroupedBatchSampler(
+        dataset.lengths, batch_size, shuffle, group_by_length, seed, rank, world_size
+    )
     return DataLoader(
-        PromptCompletionDataset(path, num_experts),
-        batch_size=batch_size,
-        shuffle=shuffle,
+        dataset,
+        batch_sampler=sampler,
         num_workers=num_workers,
         collate_fn=collate,
-        drop_last=drop_last,
+        persistent_workers=num_workers > 0,
+        prefetch_factor=4 if num_workers > 0 else None,
     )

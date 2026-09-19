@@ -3,6 +3,7 @@ import json
 import logging
 import sys
 
+import torch
 from tqdm import tqdm
 
 from mot import MixtureOfThoughts, load_config
@@ -29,17 +30,24 @@ def main() -> None:
     parser.add_argument("overrides", nargs="*")
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    torch.set_float32_matmul_precision("high")
 
     cfg = load_config(args.config, args.overrides)
     model = MixtureOfThoughts.load(args.checkpoint, cfg.model) if args.checkpoint else MixtureOfThoughts(cfg.model)
     prompts = read_prompts(args.prompts)
     out = open(args.output, "w") if args.output else sys.stdout
     bs = cfg.generation.batch_size
-    for i in tqdm(range(0, len(prompts), bs), disable=out is sys.stdout):
-        result = model.generate(prompts[i : i + bs], cfg.generation)
-        for prompt, text, active in zip(prompts[i : i + bs], result.texts, result.routing.active.tolist()):
-            out.write(json.dumps({"prompt": prompt, "completion": text, "experts": active}) + "\n")
-        out.flush()
+    # length-sorted batches pad less; results are written back in input order
+    order = sorted(range(len(prompts)), key=lambda i: len(prompts[i]), reverse=True)
+    results: list[dict | None] = [None] * len(prompts)
+    for start in tqdm(range(0, len(order), bs), disable=out is sys.stdout):
+        ids = order[start : start + bs]
+        result = model.generate([prompts[i] for i in ids], cfg.generation)
+        for i, text, active in zip(ids, result.texts, result.routing.active.tolist()):
+            results[i] = {"prompt": prompts[i], "completion": text, "experts": active}
+    for row in results:
+        out.write(json.dumps(row) + "\n")
+    out.flush()
 
 
 if __name__ == "__main__":

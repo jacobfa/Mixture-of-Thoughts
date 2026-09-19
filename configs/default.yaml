@@ -20,30 +20,60 @@ model:
     dropout: 0.1
     placement: uniform           # uniform | shallow | intermediate | deep
     cross_attention: true        # false -> "MoT w/o CrossAttn" ablation (projectors only)
+    # Block design. Paper block: norm=false rope=false expert_bias=false ffn=false symmetric=false num_registers=0
+    norm: true                   # per-expert RMSNorm on inputs, pre-norm on latents, QK-norm
+    rope: true                   # RoPE over the character-offset alignment time (shared across tokenizers)
+    rope_theta: 10000.0
+    time_scale: 4.0              # characters per RoPE position (~ chars/token)
+    expert_bias: true            # learned per-expert key/value bias (stream identity)
+    ffn: true                    # SwiGLU after attention
+    ffn_mult: 2.0
+    symmetric: true              # peers attend too (false -> only the primary reads the board)
+    num_registers: 4             # learned always-visible key/value slots (attention sinks)
+    loops: 1                     # passes per interaction block (shared weights); >1 = recurrent latent refinement
   dtype: bfloat16
   attn_implementation: kernels-community/flash-attn3   # FlashAttention-3 via HF hub kernels (H100/H200); falls back to sdpa
-  devices: null                  # null -> round-robin experts over all visible GPUs
-  main_device: cuda:0            # router, prompt encoder and interaction layers live here
+  devices: null                  # null -> single process: round-robin experts over all visible GPUs
+                                 #         torchrun/deepspeed: each rank gets an equal slice of the node's GPUs
+  main_device: cuda:0            # router, prompt encoder and interaction layers live here (first rank GPU when distributed)
   gradient_checkpointing: true
+  compile: false                 # regional torch.compile of every expert decoder layer (dynamic shapes)
 
 train:
   data: data/train.jsonl         # {"prompt", "completion", "expert_scores": [M floats] (optional)}
   output_dir: runs/default
   epochs: 3
-  batch_size: 16
+  batch_size: 16                 # per rank micro-batch
+  grad_accum: 1
   lr: 5e-5
   weight_decay: 0.01
+  scheduler: cosine_with_min_lr  # any transformers scheduler name (linear, cosine, cosine_with_min_lr, wsd, ...)
+  min_lr_ratio: 0.1
   warmup_steps: 500
   grad_clip: 1.0
   max_length: 512
+  group_by_length: true          # length-bucketed batches -> less padding
   seed: 42
   log_every: 10
   save_every: 1000
   num_workers: 4
   resume: null
+  deepspeed: null                # e.g. configs/deepspeed/zero0.json (run under torchrun)
+  optim:
+    name: muon                   # muon | adamw
+    muon_lr: null                # null -> shares train.lr (Muon updates are RMS-matched to AdamW)
+    momentum: 0.95
+    nesterov: true
+    ns_steps: 5
+    adjust_lr: match_rms_adamw   # match_rms_adamw | original
+    betas: [0.9, 0.95]
+    eps: 1e-8
   loss:
     routing: ce                  # ce | bce | none  (supervised router loss on expert_scores)
     routing_weight: 1.0
+    peer_lm_weight: 0.1          # NLL of peer streams on their own tokenization; 0 -> peers' tail layers are skipped
+    lm_chunk_size: 2048          # completion tokens per lm_head + CE chunk
+    fused_ce: true               # Liger fused linear-CE when installed (pip install mot[liger])
 
 generation:
   max_prompt_length: 2048

@@ -26,12 +26,35 @@ class RouterConfig:
 
 @dataclass
 class InteractionConfig:
+    """Latent interaction block. The paper's block is recovered with
+    norm=false rope=false expert_bias=false ffn=false symmetric=false num_registers=0.
+
+    norm:          per-expert RMSNorm on hidden states before projection, pre-norm on latents, QK-norm
+    rope:          rotary positions in the shared space computed from the character-offset alignment time
+                   (the one coordinate shared by all tokenizers); time_scale ~ characters per position
+    expert_bias:   learned per-expert key/value bias so attention knows which stream a key came from
+    ffn:           SwiGLU after attention (hidden = ffn_mult * shared_dim)
+    symmetric:     every active stream attends over the board (default: only the primary reads)
+    num_registers: learned key/value register slots always visible to every query (attention sinks)
+    loops:         passes of each interaction block at its position (shared weights, learned per-pass embedding);
+                   >1 = recurrent latent refinement without re-running expert layers"""
+
     num_layers: int = 8
     shared_dim: int = 2048
     num_heads: int = 8
     dropout: float = 0.1
     placement: str = "uniform"
     cross_attention: bool = True
+    norm: bool = True
+    rope: bool = True
+    rope_theta: float = 10000.0
+    time_scale: float = 4.0
+    expert_bias: bool = True
+    ffn: bool = True
+    ffn_mult: float = 2.0
+    symmetric: bool = True
+    num_registers: int = 4
+    loops: int = 1
 
 
 @dataclass
@@ -45,6 +68,7 @@ class ModelConfig:
     devices: list[str] | None = None
     main_device: str = "cuda:0"
     gradient_checkpointing: bool = True
+    compile: bool = False
 
 
 @dataclass
@@ -55,10 +79,33 @@ class LossConfig:
       - "ce":   softmax cross-entropy against the label distribution (hard argmax if labels are 0/1)
       - "bce":  independent sigmoid per expert against labels in [0, 1]
       - "none": router learns only through the straight-through LM gradient
+    peer_lm_weight: NLL of the non-primary streams on their own tokenization of the completion; anchors peer
+      representations that are otherwise only shaped by what helps the primary. 0 disables it and lets the
+      trainer skip the peers' tail layers entirely.
+    lm_chunk_size: completion tokens per lm_head + cross-entropy chunk (bounds the [N, V] logits buffer)
+    fused_ce: use Liger's fused linear-cross-entropy kernel when installed and running on CUDA
     """
 
     routing: str = "ce"
     routing_weight: float = 1.0
+    peer_lm_weight: float = 0.0
+    lm_chunk_size: int = 2048
+    fused_ce: bool = True
+
+
+@dataclass
+class OptimConfig:
+    """muon: Muon on 2D hidden weights (RMS-matched to AdamW, so lr/weight decay are shared) + AdamW on
+    biases and the router head. adamw: fused torch AdamW on everything."""
+
+    name: str = "muon"
+    muon_lr: float | None = None
+    momentum: float = 0.95
+    nesterov: bool = True
+    ns_steps: int = 5
+    adjust_lr: str = "match_rms_adamw"
+    betas: list[float] = field(default_factory=lambda: [0.9, 0.95])
+    eps: float = 1e-8
 
 
 @dataclass
@@ -67,16 +114,22 @@ class TrainConfig:
     output_dir: str = "runs/default"
     epochs: int = 50
     batch_size: int = 64
+    grad_accum: int = 1
     lr: float = 5e-5
     weight_decay: float = 0.01
+    scheduler: str = "cosine_with_min_lr"
+    min_lr_ratio: float = 0.1
     warmup_steps: int = 1000
     grad_clip: float = 1.0
     max_length: int = 512
+    group_by_length: bool = True
     seed: int = 42
     log_every: int = 10
     save_every: int = 1000
     num_workers: int = 4
     resume: str | None = None
+    deepspeed: str | None = None
+    optim: OptimConfig = field(default_factory=OptimConfig)
     loss: LossConfig = field(default_factory=LossConfig)
 
 

@@ -57,7 +57,10 @@ class ExpertPool:
             log.info("loading expert %d: %s -> %s", i, spec.name, device)
             model = load_causal_lm(spec.name, device, dtype, cfg.attn_implementation)
             tokenizer = load_tokenizer(spec)
-            experts.append(StackedExpert(model, tokenizer, cfg.interaction.num_layers, cfg.interaction.placement))
+            expert = StackedExpert(model, tokenizer, cfg.interaction.num_layers, cfg.interaction.placement)
+            if cfg.compile:
+                expert.compile()
+            experts.append(expert)
         return cls(experts)
 
     def __len__(self) -> int:

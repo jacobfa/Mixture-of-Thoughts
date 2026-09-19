@@ -24,6 +24,8 @@ class ExpertBatch:
     attention_mask: Tensor  # [b, T]
     time: Tensor  # [b, T] alignment coordinate (char offset of token end)
     labels: Tensor | None = None  # [b, T]
+    primary_index: Tensor | None = None  # CPU long indices of rows with slot == 0 (kept on CPU by `to`)
+    peer_index: Tensor | None = None  # CPU long indices of rows with slot != 0
 
     @property
     def position_ids(self) -> Tensor:
@@ -32,6 +34,16 @@ class ExpertBatch:
     @property
     def primary_rows(self) -> Tensor:
         return self.slot == 0
+
+    def primary_ids(self) -> Tensor:
+        if self.primary_index is None:
+            self.primary_index = (self.slot == 0).nonzero(as_tuple=True)[0].cpu()
+        return self.primary_index
+
+    def peer_ids(self) -> Tensor:
+        if self.peer_index is None:
+            self.peer_index = (self.slot != 0).nonzero(as_tuple=True)[0].cpu()
+        return self.peer_index
 
     def to(self, device: torch.device | str) -> ExpertBatch:
         return ExpertBatch(
@@ -42,6 +54,8 @@ class ExpertBatch:
             self.attention_mask.to(device),
             self.time.to(device),
             None if self.labels is None else self.labels.to(device),
+            self.primary_index,
+            self.peer_index,
         )
 
 
@@ -127,5 +141,7 @@ def build_batches(
             attention_mask=pad_stack([torch.ones_like(s) for s in ids], length, 0, padding_side),
             time=pad_stack(time, length, PAD_TIME, padding_side),
             labels=None if labels is None else pad_stack(labels, length, IGNORE_INDEX, padding_side),
+            primary_index=(slot == 0).nonzero(as_tuple=True)[0],
+            peer_index=(slot != 0).nonzero(as_tuple=True)[0],
         )
     return batches

@@ -3,7 +3,13 @@ import torch
 
 from mot.experts.backbone import layer_segments
 from mot.experts.streams import IGNORE_INDEX, PAD_TIME, encode
-from mot.interaction.attention import alignment_mask
+from mot.interaction.attention import (
+    REGISTER_TIME,
+    InteractionCache,
+    SharedCrossAttention,
+    TimeRotary,
+    alignment_mask,
+)
 from mot.losses import routing_loss
 from mot.routing.router import Router
 
@@ -62,6 +68,37 @@ def test_alignment_mask_hides_padding():
     k = torch.tensor([[PAD_TIME, 2, 4, 6]])
     mask = alignment_mask(q, k)[0, 0]
     assert mask.tolist() == [[False, True, False, False], [False, True, True, False], [True, True, True, True]]
+
+
+def test_time_rotary_is_relative():
+    """Rotating q at t1 and k at t2 gives the same score as rotating at t1+d and t2+d, and padding
+    sentinels must not produce NaNs."""
+    torch.manual_seed(0)
+    rope = TimeRotary(head_dim=8, theta=10000.0, time_scale=4.0)
+    q, k = torch.randn(1, 3, 2, 8), torch.randn(1, 3, 2, 8)
+    tq = torch.tensor([[5, 17, 40]])
+    tk = torch.tensor([[2, 20, 33]])
+    base = (rope(q, tq) * rope(k, tk)).sum(-1)
+    shifted = (rope(q, tq + 1000) * rope(k, tk + 1000)).sum(-1)
+    assert torch.allclose(base, shifted, atol=1e-4)
+    assert not torch.allclose(base, (q * k).sum(-1))
+    padded = rope(k, torch.tensor([[PAD_TIME, REGISTER_TIME, 7]]))
+    assert torch.isfinite(padded).all()
+
+
+def test_shared_attention_registers_and_cache_consistency():
+    torch.manual_seed(0)
+    attn = SharedCrossAttention(16, 2, 0.0, num_experts=3, num_registers=2).eval()
+    B, K, T = 2, 2, 5
+    board = torch.randn(B, K, T, 16)
+    board_time = torch.arange(1, T + 1).repeat(B, K, 1) * 3
+    board_expert = torch.tensor([[0, 1], [2, 0]])
+    full = attn(board[:, 0], board_time[:, 0], board, board_time, board_expert)
+    cache = InteractionCache()
+    step_a = attn(board[:, 0, :3], board_time[:, 0, :3], board[:, :, :3], board_time[:, :, :3], board_expert, cache)
+    step_b = attn(board[:, 0, 3:], board_time[:, 0, 3:], board[:, :, 3:], board_time[:, :, 3:], board_expert, cache)
+    assert torch.allclose(full, torch.cat([step_a, step_b], 1), atol=1e-5)
+    assert cache.keys.shape == (B, K, T, 2, 8)
 
 
 def test_router_selection_and_gate():

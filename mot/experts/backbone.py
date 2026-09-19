@@ -40,6 +40,7 @@ class ExpertState:
     hidden: Tensor
     attention_mask: Tensor | None
     position_ids: Tensor
+    cache_position: Tensor
     position_embeddings: tuple[Tensor, Tensor]
     cache: Cache | None
 
@@ -81,6 +82,12 @@ class StackedExpert:
         else:
             self.model.gradient_checkpointing_disable()
 
+    def compile(self, **kwargs) -> None:
+        """Regional compilation: one compiled graph per decoder layer, reused across all layers."""
+        kwargs.setdefault("dynamic", True)
+        for layer in self.decoder.layers:
+            layer.compile(**kwargs)
+
     def train(self, mode: bool) -> None:
         self.model.train(mode)
 
@@ -95,6 +102,8 @@ class StackedExpert:
         cache: Cache | None = None,
     ) -> ExpertState:
         embeds = self.decoder.embed_tokens(input_ids)
+        past = cache.get_seq_length() if cache is not None else 0
+        cache_position = torch.arange(past, past + input_ids.shape[1], device=embeds.device)
         mask_fn = (
             create_sliding_window_causal_mask
             if getattr(self.model.config, "sliding_window", None)
@@ -104,11 +113,25 @@ class StackedExpert:
             config=self.model.config,
             inputs_embeds=embeds,
             attention_mask=attention_mask,
+            cache_position=cache_position,
             past_key_values=cache,
             position_ids=position_ids,
         )
         position_embeddings = self.decoder.rotary_emb(embeds, position_ids=position_ids)
-        return ExpertState(embeds, causal_mask, position_ids, position_embeddings, cache)
+        return ExpertState(embeds, causal_mask, position_ids, cache_position, position_embeddings, cache)
+
+    def select_rows(self, state: ExpertState, rows: Tensor) -> ExpertState | None:
+        """Restrict a (cache-free) state to a subset of batch rows; None when the mask cannot be sliced."""
+        mask = state.attention_mask
+        if state.cache is not None or (mask is not None and not isinstance(mask, Tensor)):
+            return None
+        if mask is not None and mask.shape[0] != 1:
+            mask = mask[rows]
+        cos, sin = state.position_embeddings
+        if cos.shape[0] != 1:
+            cos, sin = cos[rows], sin[rows]
+        pos = state.position_ids if state.position_ids.shape[0] == 1 else state.position_ids[rows]
+        return ExpertState(state.hidden[rows], mask, pos, state.cache_position, (cos, sin), None)
 
     def run_segment(self, state: ExpertState, index: int) -> Tensor:
         start, end = self.segments[index]
@@ -120,10 +143,18 @@ class StackedExpert:
                 position_ids=state.position_ids,
                 past_key_values=state.cache,
                 use_cache=state.cache is not None,
+                cache_position=state.cache_position,
                 position_embeddings=state.position_embeddings,
             )
         state.hidden = hidden
         return hidden
 
+    def norm(self, hidden: Tensor) -> Tensor:
+        return self.decoder.norm(hidden)
+
+    @property
+    def lm_head(self):
+        return self.model.lm_head
+
     def logits(self, hidden: Tensor) -> Tensor:
-        return self.model.lm_head(self.decoder.norm(hidden))
+        return self.lm_head(self.norm(hidden))
