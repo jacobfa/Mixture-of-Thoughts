@@ -32,7 +32,7 @@ def linear_cross_entropy(lm_head: nn.Module, hidden: Tensor, targets: Tensor, ch
     """Sum of token NLLs for lm_head(hidden) without materialising the full [N, V] logits."""
     if hidden.shape[0] == 0:
         return hidden.new_zeros((), dtype=torch.float32)
-    if fused and _liger_ce is not None and hidden.is_cuda and lm_head.bias is None:
+    if fused and _liger_ce is not None and hidden.is_cuda and isinstance(lm_head, nn.Linear) and lm_head.bias is None:
         return _liger_ce(lm_head.weight, hidden.to(lm_head.weight.dtype), targets).float()
     recompute = torch.is_grad_enabled() and hidden.requires_grad and hidden.shape[0] > chunk_size
     total = None

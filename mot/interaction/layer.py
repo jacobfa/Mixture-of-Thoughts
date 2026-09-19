@@ -6,7 +6,7 @@ from torch import Tensor, nn
 
 from mot.config import InteractionConfig
 from mot.experts.streams import PAD_TIME, ExpertBatch
-from mot.interaction.attention import InteractionCache, SharedCrossAttention
+from mot.interaction.attention import InteractionCache, RMSNorm, SharedCrossAttention
 
 
 class SwiGLU(nn.Module):
@@ -23,20 +23,22 @@ class SwiGLU(nn.Module):
 class InteractionLayer(nn.Module):
     """One latent-space interaction: per-expert (norm ->) forward projector into the shared space, a
     pre-norm attention (+ SwiGLU) block over the board of K active streams, and a zero-initialised
-    per-expert reverse projector added back onto each expert's residual stream."""
+    per-expert reverse projector added back onto each expert's residual stream, scaled by a per-expert
+    `gain` (1 until `MixtureOfThoughts.calibrate` sets it to the perturbation scale the expert tolerates)."""
 
     def __init__(self, expert_dims: list[int], cfg: InteractionConfig, top_k: int):
         super().__init__()
         self.top_k = top_k
         self.shared_dim = cfg.shared_dim
         self.symmetric = cfg.symmetric
-        norm = (lambda d: nn.RMSNorm(d, eps=1e-6)) if cfg.norm else (lambda d: nn.Identity())
+        norm = (lambda d: RMSNorm(d, eps=1e-6)) if cfg.norm else (lambda d: nn.Identity())
         self.in_norm = nn.ModuleList(norm(d) for d in expert_dims)
         self.forward_proj = nn.ModuleList(nn.Linear(d, cfg.shared_dim) for d in expert_dims)
         self.reverse_proj = nn.ModuleList(nn.Linear(cfg.shared_dim, d) for d in expert_dims)
         for proj in self.reverse_proj:
             nn.init.zeros_(proj.weight)
             nn.init.zeros_(proj.bias)
+        self.register_buffer("gain", torch.ones(len(expert_dims)))
         self.attn = None
         self.ffn = None
         if cfg.cross_attention:
@@ -109,5 +111,6 @@ class InteractionLayer(nn.Module):
             latents = {m: board[batches[m].rows, batches[m].slot] for m in latents}
 
         return {
-            m: h + self.reverse_proj[m](self.dropout(latents[m])).to(h.device, h.dtype) for m, h in hiddens.items()
+            m: h + (self.reverse_proj[m](self.dropout(latents[m])) * self.gain[m]).to(h.device, h.dtype)
+            for m, h in hiddens.items()
         }

@@ -45,3 +45,6 @@ wandb/
 .DS_Store
 .idea/
 .vscode/
+
+# Datasets
+data/

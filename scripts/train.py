@@ -1,10 +1,14 @@
 import argparse
 import logging
+from pathlib import Path
 
 import torch
 
 from mot import MixtureOfThoughts, distributed, load_config
+from mot.tracking import configure_logging
 from mot.training import Trainer
+
+log = logging.getLogger("train")
 
 
 def main() -> None:
@@ -15,10 +19,8 @@ def main() -> None:
     cfg = load_config(args.config, args.overrides)
 
     distributed.init(use_deepspeed=cfg.train.deepspeed is not None)
-    logging.basicConfig(
-        level=logging.INFO if distributed.is_main() else logging.WARNING,
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-    )
+    run_name = cfg.train.wandb.name or Path(cfg.train.output_dir).name
+    configure_logging(cfg.train.log_file or f"logs/{run_name}.log")
     torch.set_float32_matmul_precision("high")
     if distributed.is_distributed():
         devices = distributed.local_devices()
@@ -28,7 +30,9 @@ def main() -> None:
 
     torch.manual_seed(cfg.train.seed)
     model = MixtureOfThoughts(cfg.model)
-    Trainer(model, cfg.train).fit()
+    trainer = Trainer(model, cfg.train)
+    trainer.fit()
+    log.info("done: %d optimizer steps, checkpoints in %s", trainer.step, cfg.train.output_dir)
 
 
 if __name__ == "__main__":

@@ -36,6 +36,13 @@ class InteractionCache:
         return self.keys, self.values, self.time
 
 
+class RMSNorm(nn.RMSNorm):
+    """fp32 statistics regardless of the activation dtype; output cast back to the input dtype."""
+
+    def forward(self, x: Tensor) -> Tensor:
+        return super().forward(x.float()).to(x.dtype)
+
+
 def rotate_half(x: Tensor) -> Tensor:
     a, b = x.chunk(2, dim=-1)
     return torch.cat([-b, a], dim=-1)
@@ -88,8 +95,8 @@ class SharedCrossAttention(nn.Module):
         self.v_proj = nn.Linear(dim, dim, bias=False)
         self.o_proj = nn.Linear(dim, dim, bias=False)
         self.dropout = dropout
-        self.q_norm = nn.RMSNorm(self.head_dim, eps=1e-6) if qk_norm else nn.Identity()
-        self.k_norm = nn.RMSNorm(self.head_dim, eps=1e-6) if qk_norm else nn.Identity()
+        self.q_norm = RMSNorm(self.head_dim, eps=1e-6) if qk_norm else nn.Identity()
+        self.k_norm = RMSNorm(self.head_dim, eps=1e-6) if qk_norm else nn.Identity()
         self.rope = TimeRotary(self.head_dim, rope_theta, time_scale) if rope else None
         self.kv_bias = nn.Embedding(num_experts, 2 * dim) if expert_bias else None
         if self.kv_bias is not None:

@@ -9,6 +9,7 @@ from torch import Tensor
 from torch.utils.data import DataLoader, Dataset, Sampler
 
 EXPERT_SCORES = "expert_scores"
+EXPERT_NLL = "expert_nll"
 
 
 @dataclass
@@ -16,6 +17,7 @@ class Batch:
     prompts: list[str]
     completions: list[str]
     expert_targets: Tensor | None  # [B, M] per-expert quality labels, or None when the data has none
+    expert_nll: Tensor | None = None  # [B, M] standalone NLL of each expert on the completion (reference only)
 
 
 class PromptCompletionDataset(Dataset):
@@ -51,10 +53,12 @@ class PromptCompletionDataset(Dataset):
 
 
 def collate(rows: list[dict]) -> Batch:
-    targets = None
+    targets = nll = None
     if EXPERT_SCORES in rows[0]:
         targets = torch.tensor([r[EXPERT_SCORES] for r in rows], dtype=torch.float32)
-    return Batch([r["prompt"] for r in rows], [r["completion"] for r in rows], targets)
+    if all(EXPERT_NLL in r for r in rows):
+        nll = torch.tensor([r[EXPERT_NLL] for r in rows], dtype=torch.float32)
+    return Batch([r["prompt"] for r in rows], [r["completion"] for r in rows], targets, nll)
 
 
 class LengthGroupedBatchSampler(Sampler[list[int]]):

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import logging
+import math
 from contextlib import nullcontext
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import torch
@@ -19,6 +21,7 @@ from mot.routing import PromptEncoder, Router, RoutingDecision
 
 WEIGHTS_FILE = "mot.safetensors"
 CONFIG_FILE = "model.yaml"
+log = logging.getLogger(__name__)
 
 
 @dataclass
@@ -147,9 +150,7 @@ class MixtureOfThoughts(nn.Module):
             rows = tail_rows[m]
             if rows.numel() == 0:
                 continue
-            rows = rows.to(expert.device)
-            sub = expert.select_rows(state, rows)
-            out[m] = expert.run_segment(sub, tail) if sub is not None else expert.run_segment(state, tail)[rows]
+            out[m] = expert.run_segment(state, tail)[rows.to(expert.device)]
         return out
 
     def _teacher_forced(
@@ -209,11 +210,67 @@ class MixtureOfThoughts(nn.Module):
             total = total + w.routing_weight * out["routing"]
         out["loss"] = total
         out["active"] = decision.active
+        out["tokens"] = sum(b.attention_mask.sum() for b in batches.values())
         return out
 
     def _batches(self, active, prompts, completions, max_length, padding_side, add_eos) -> dict[int, ExpertBatch]:
         batches = build_batches(self.pool, active, prompts, completions, max_length, padding_side, add_eos)
         return {m: b.to(self.main_device) for m, b in batches.items()}
+
+    # ------------------------------------------------------------------ calibration
+
+    @property
+    def is_calibrated(self) -> bool:
+        return any(not torch.all(layer.gain == 1) for layer in self.interactions)
+
+    @torch.no_grad()
+    def calibrate(
+        self, prompts: list[str], completions: list[str], max_length: int, target: float | None = None, seed: int = 0
+    ) -> Tensor:
+        """Set each interaction layer's per-expert gain to the per-element noise scale that raises that expert's own
+        NLL by `target` nats/token when added to its residual stream at that layer (log-space bisection). Returns
+        the [Q, M] gain matrix. Experts differ by orders of magnitude here, and scale-free optimizers would
+        otherwise inject the same perturbation into all of them."""
+        target = self.cfg.interaction.calibration_target if target is None else target
+        was_training = self.training
+        self.eval()
+        Q, M = len(self.interactions), len(self.pool)
+        gains = torch.ones(Q, M)
+        for m, expert in enumerate(self.pool):
+            active = torch.full((len(prompts), 1), m, dtype=torch.long)
+            batch = build_batches(self.pool, active, prompts, completions, max_length, "right", True)[m].to(expert.device)
+            state = expert.begin(batch.input_ids, batch.attention_mask, batch.position_ids)
+            boundaries = []
+            for q in range(Q):
+                expert.run_segment(state, q)
+                boundaries.append(state.hidden.clone())
+            expert.run_segment(state, Q)
+
+            def nll(hidden_q: Tensor, q: int) -> float:
+                st = replace(state, hidden=hidden_q)
+                for k in range(q + 1, Q + 1):
+                    expert.run_segment(st, k)
+                states, targets = supervised_positions(st.hidden, batch.labels)
+                return lm_loss({m: (expert.lm_head, expert.norm(states), targets)}, fused=False).item()
+
+            base = nll(boundaries[Q - 1], Q - 1)
+            gen = torch.Generator(device=expert.device).manual_seed(seed)
+            for q in range(Q):
+                noise = torch.randn(boundaries[q].shape, generator=gen, device=expert.device, dtype=torch.float32)
+                lo, hi = math.log(1e-5), math.log(10.0)
+                for _ in range(10):
+                    mid = (lo + hi) / 2
+                    perturbed = (boundaries[q].float() + noise * math.exp(mid)).to(boundaries[q].dtype)
+                    if nll(perturbed, q) - base < target:
+                        lo = mid
+                    else:
+                        hi = mid
+                gains[q, m] = math.exp(lo)
+            log.info("calibrated expert %d: base nll %.4f, gains %s", m, base, [f"{g:.2e}" for g in gains[:, m].tolist()])
+        for q, layer in enumerate(self.interactions):
+            layer.gain.copy_(gains[q].to(layer.gain.device))
+        self.train(was_training)
+        return gains
 
     # ------------------------------------------------------------------ generation
 
@@ -247,6 +304,7 @@ class MixtureOfThoughts(nn.Module):
         alive = {m: torch.ones(len(b.rows), dtype=torch.bool, device=dev) for m, b in batches.items()}
         done = torch.zeros(B, dtype=torch.bool, device=dev)
         output = torch.full((B, gen.max_new_tokens), -1, dtype=torch.long, device=dev)
+        prev = {m: torch.full((len(b.rows),), -1, dtype=torch.long, device=dev) for m, b in batches.items()}
 
         steps = 0
         for t in range(gen.max_new_tokens):
@@ -257,6 +315,9 @@ class MixtureOfThoughts(nn.Module):
                 nxt = self._sample(expert.logits(h[:, -1]), warpers).to(dev, non_blocking=True)
                 nxt = torch.where(alive[m], nxt, torch.full_like(nxt, expert.pad_token_id))
                 is_eos = nxt == expert.eos_token_id
+                if gen.stop:
+                    is_eos |= self._stop_hit(expert, prev[m], nxt, gen.stop)
+                    prev[m] = nxt
                 primary = b.primary_rows
                 rows = b.rows[primary]
                 output[rows, t] = torch.where(done[rows], torch.full_like(rows, -1), nxt[primary])
@@ -288,8 +349,16 @@ class MixtureOfThoughts(nn.Module):
             if ids and ids[-1] == expert.eos_token_id:
                 ids = ids[:-1]
             token_ids.append(ids)
-            texts.append(expert.tokenizer.decode(ids, skip_special_tokens=True))
+            text = expert.tokenizer.decode(ids, skip_special_tokens=True)
+            texts.append(text.split(gen.stop)[0] if gen.stop else text)
         return GenerationOutput(texts=texts, token_ids=token_ids, routing=decision, steps=steps)
+
+    @staticmethod
+    def _stop_hit(expert, prev: Tensor, nxt: Tensor, stop: str) -> Tensor:
+        """Rows whose last two tokens decode to text containing `stop`."""
+        decode = expert.tokenizer.decode
+        hits = [stop in decode([tok for tok in pair if tok >= 0]) for pair in torch.stack([prev, nxt], 1).tolist()]
+        return torch.tensor(hits, dtype=torch.bool, device=nxt.device)
 
     @staticmethod
     def _warpers(gen: GenerationConfig) -> LogitsProcessorList | None:

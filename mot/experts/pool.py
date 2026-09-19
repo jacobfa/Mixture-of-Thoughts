@@ -27,7 +27,21 @@ def load_causal_lm(name: str, device: str, dtype: torch.dtype, attn_implementati
             raise
         log.warning("attn_implementation=%r failed for %s (%s); falling back to sdpa", attn_implementation, name, err)
         model = AutoModelForCausalLM.from_pretrained(name, attn_implementation="sdpa", **kwargs)
+    drop_non_text_modules(model)
     return model.eval()
+
+
+def drop_non_text_modules(model: PreTrainedModel) -> None:
+    """Free the vision/audio towers of a multimodal checkpoint; only the text decoder and lm_head are used."""
+    decoder = model.get_decoder()
+    parents = [model, *(c for _, c in model.named_children() if c is not decoder and any(m is decoder for m in c.modules()))]
+    for parent in parents:
+        for name, child in list(parent.named_children()):
+            if child is decoder or child is model.lm_head or any(m is decoder for m in child.modules()):
+                continue
+            if next(child.parameters(), None) is not None:
+                log.info("dropping %s.%s (%.2fB params)", type(parent).__name__, name, sum(p.numel() for p in child.parameters()) / 1e9)
+                delattr(parent, name)
 
 
 def load_tokenizer(spec: ExpertSpec):
@@ -55,7 +69,7 @@ class ExpertPool:
         for i, spec in enumerate(cfg.experts):
             device = spec.device or devices[i % len(devices)]
             log.info("loading expert %d: %s -> %s", i, spec.name, device)
-            model = load_causal_lm(spec.name, device, dtype, cfg.attn_implementation)
+            model = load_causal_lm(spec.name, device, dtype, spec.attn_implementation or cfg.attn_implementation)
             tokenizer = load_tokenizer(spec)
             expert = StackedExpert(model, tokenizer, cfg.interaction.num_layers, cfg.interaction.placement)
             if cfg.compile:

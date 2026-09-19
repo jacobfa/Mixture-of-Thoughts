@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import json
 import logging
+import sys
 import time
 from pathlib import Path
 
 import torch
+from omegaconf import OmegaConf
 from safetensors.torch import load_file
 from torch.nn.utils import clip_grad_norm_
 from tqdm import tqdm
@@ -16,10 +18,18 @@ from mot.config import TrainConfig
 from mot.data import Batch, make_loader
 from mot.model import WEIGHTS_FILE, MixtureOfThoughts
 from mot.optim import MuonAdamW, build_optimizer
+from mot.tracking import WandbRun, config_dict
 
 log = logging.getLogger(__name__)
 TRAINER_STATE = "trainer.pt"
 DS_TAG = "deepspeed"
+
+
+def fmt_duration(seconds: float) -> str:
+    seconds = int(max(seconds, 0))
+    h, rem = divmod(seconds, 3600)
+    m, s = divmod(rem, 60)
+    return f"{h}:{m:02d}:{s:02d}"
 
 
 class Trainer:
@@ -87,12 +97,17 @@ class Trainer:
         self.micro = 0
         self._sums: dict[str, torch.Tensor] = {}
         self._usage = torch.zeros(len(model.pool), dtype=torch.long, device=model.main_device)
+        self._tokens = torch.zeros((), dtype=torch.long, device=model.main_device)
         self._n = 0
         self._t_last = time.perf_counter()
+        self._t_start = self._t_last
+        self._step_start = 0
         self.metrics = open(self.out_dir / "metrics.jsonl", "a") if self.is_main else None
         if cfg.resume:
             self.load_checkpoint(cfg.resume)
+        self.wandb = WandbRun(cfg.wandb, {"model": config_dict(model.cfg), "train": config_dict(cfg)})
         if self.is_main:
+            log.info("config:\n%s", OmegaConf.to_yaml({"model": config_dict(model.cfg), "train": config_dict(cfg)}))
             log.info("trainable parameters: %.1fM", model.num_trainable_parameters() / 1e6)
             log.info(
                 "%d ranks, %d micro-batches/epoch/rank, grad_accum=%d, %d optimizer steps",
@@ -101,6 +116,7 @@ class Trainer:
                 cfg.grad_accum,
                 self.total_steps,
             )
+            self.wandb.summary({"trainable_parameters": model.num_trainable_parameters(), "total_steps": self.total_steps})
 
     def _deepspeed_config(self) -> dict:
         cfg = self.cfg
@@ -120,15 +136,41 @@ class Trainer:
 
     # ------------------------------------------------------------------ loop
 
+    def calibrate(self) -> None:
+        ia = self.model.cfg.interaction
+        if not ia.calibrate or self.model.is_calibrated:
+            return
+        dataset = self.loader.dataset
+        lengths = dataset.lengths
+        order = sorted(range(len(dataset)), key=lambda i: lengths[i])
+        mid = len(order) // 2
+        rows = [dataset[i] for i in order[mid : mid + ia.calibration_samples]]
+        t = time.perf_counter()
+        gains = self.model.calibrate([r["prompt"] for r in rows], [r["completion"] for r in rows], self.cfg.max_length)
+        distributed.broadcast_params([layer.gain for layer in self.model.interactions])
+        if self.is_main:
+            log.info("reverse-projection gains [layer, expert] (%.0fs):\n%s", time.perf_counter() - t, gains)
+            self.wandb.summary({"gain": gains.tolist()})
+
     def fit(self) -> None:
+        self.calibrate()
         self.model.train()
+        self._t_start = self._t_last = time.perf_counter()
+        self._step_start = self.step
+        show_bar = self.is_main and sys.stderr.isatty()
         for epoch in range(self.epoch, self.cfg.epochs):
             self.epoch = epoch
+            t_epoch = time.perf_counter()
             self.loader.batch_sampler.set_epoch(epoch)
-            for batch in tqdm(self.loader, desc=f"epoch {epoch}", dynamic_ncols=True, disable=not self.is_main):
+            for batch in tqdm(self.loader, desc=f"epoch {epoch}", dynamic_ncols=True, disable=not show_bar):
                 self.train_step(batch)
+            if self.is_main:
+                log.info("epoch %d/%d done in %s", epoch + 1, self.cfg.epochs, fmt_duration(time.perf_counter() - t_epoch))
             self.save_checkpoint(self.out_dir / "latest")
         self.save_checkpoint(self.out_dir / "final")
+        if self.is_main:
+            log.info("training finished: %d steps in %s", self.step, fmt_duration(time.perf_counter() - self._t_start))
+        self.wandb.finish()
 
     def train_step(self, batch: Batch) -> dict[str, float] | None:
         cfg = self.cfg
@@ -168,16 +210,22 @@ class Trainer:
     @torch.no_grad()
     def _accumulate(self, out: dict, batch: Batch) -> None:
         for k, v in out.items():
-            if torch.is_tensor(v) and v.ndim == 0:
+            if k != "tokens" and torch.is_tensor(v) and v.ndim == 0:
                 v = v.detach().float()
                 self._sums[k] = v if k not in self._sums else self._sums[k] + v
         active = out["active"]
         self._usage += torch.bincount(active.flatten(), minlength=len(self.model.pool))
+        if "tokens" in out:
+            self._tokens += out["tokens"].to(self._tokens.device)
         if batch.expert_targets is not None:
             targets = batch.expert_targets.to(active.device)
             primary_score = targets.gather(1, active[:, :1]).squeeze(1)
             hit = (primary_score >= targets.max(-1).values).float().mean()
             self._sums["primary_is_best"] = hit if "primary_is_best" not in self._sums else self._sums["primary_is_best"] + hit
+        if batch.expert_nll is not None:
+            nll = batch.expert_nll.to(active.device)
+            for k, v in (("ref_primary", nll.gather(1, active[:, :1]).mean()), ("ref_best", nll.min(-1).values.mean())):
+                self._sums[k] = v if k not in self._sums else self._sums[k] + v
         self._n += 1
 
     def _flush(self, grad_norm) -> dict[str, float]:
@@ -186,25 +234,58 @@ class Trainer:
         stacked = distributed.all_reduce_mean(stacked)
         values = stacked.tolist()
         usage = self._usage.tolist()
+        tokens = int(distributed.all_reduce_mean(self._tokens.float()).item() * self.world)
         now = time.perf_counter()
+        interval = now - self._t_last
+        elapsed = now - self._t_start
+        done = self.step - self._step_start
+        sec_per_step = elapsed / max(done, 1)
+        remaining = max(self.total_steps - self.step, 0)
+        eta = remaining * sec_per_step
         record = dict(zip(keys, values))
         record.update(
             step=self.step,
             epoch=self.epoch,
             lr=self.scheduler.get_last_lr()[0],
             grad_norm=float(grad_norm) if grad_norm is not None else float("nan"),
-            sec_per_step=(now - self._t_last) / max(self.cfg.log_every, 1),
+            sec_per_step=interval / max(self.cfg.log_every, 1),
+            tokens_per_sec=tokens / max(interval, 1e-9),
+            elapsed=elapsed,
+            eta=eta,
             usage=usage,
         )
+        if torch.cuda.is_available():
+            record["max_mem_gb"] = [round(torch.cuda.max_memory_allocated(i) / 1e9, 1) for i in range(torch.cuda.device_count())]
         self._sums.clear()
         self._usage.zero_()
+        self._tokens.zero_()
         self._n = 0
         self._t_last = now
         if self.is_main:
             self.metrics.write(json.dumps(record) + "\n")
             self.metrics.flush()
-            log.info(" ".join(f"{k}={v:.4g}" if isinstance(v, float) else f"{k}={v}" for k, v in record.items()))
+            log.info(self._format(record, eta))
+            self.wandb.log(record, step=self.step)
         return record
+
+    def _format(self, r: dict, eta: float) -> str:
+        losses = " ".join(f"{k} {r[k]:.4f}" for k in ("loss", "lm", "peer_lm", "routing") if k in r)
+        parts = [
+            f"step {r['step']:>{len(str(self.total_steps))}}/{self.total_steps} ({100 * r['step'] / max(self.total_steps, 1):5.1f}%) ep {r['epoch'] + 1}/{self.cfg.epochs}",
+            losses,
+        ]
+        if "ref_primary" in r:
+            parts.append(f"lm-ref {r['lm'] - r['ref_primary']:+.4f} (frozen primary {r['ref_primary']:.4f}, best {r['ref_best']:.4f})")
+        if "primary_is_best" in r:
+            parts.append(f"route-acc {r['primary_is_best']:.2f}")
+        parts.append(f"usage {r['usage']}")
+        parts.append(f"lr {r['lr']:.2e} gnorm {r['grad_norm']:.3g}")
+        parts.append(f"{r['sec_per_step']:.1f}s/step {r['tokens_per_sec'] / 1e3:.1f}k tok/s")
+        if "max_mem_gb" in r:
+            parts.append("mem " + "/".join(f"{m:.0f}" for m in r["max_mem_gb"]) + "G")
+        finish = time.strftime("%H:%M", time.localtime(time.time() + eta))
+        parts.append(f"elapsed {fmt_duration(r['elapsed'])} eta {fmt_duration(eta)} (~{finish})")
+        return " | ".join(parts)
 
     # ------------------------------------------------------------------ checkpoints
 
@@ -218,6 +299,7 @@ class Trainer:
                 state.update(optimizer=self.optimizer.state_dict(), scheduler=self.scheduler.state_dict())
                 torch.save(state, path / TRAINER_STATE)
             log.info("saved checkpoint to %s (step %d)", path, self.step)
+            self.wandb.summary({"last_checkpoint": str(path), "checkpoint_step": self.step})
         distributed.barrier()
 
     def load_checkpoint(self, path: str | Path) -> None:

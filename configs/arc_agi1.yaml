@@ -1,0 +1,90 @@
+# ARC-AGI-1 with three frozen experts on 2x B200. GLM + Qwen share cuda:0, Gemma and the trainable
+# router / interaction layers live on cuda:1. Gemma 4's global layers use 512-dim heads, above the
+# FlashAttention-2 limit, so it stays on sdpa.
+model:
+  experts:
+    - name: zai-org/GLM-4.7-Flash
+      device: cuda:0
+    - name: Qwen/Qwen3.8-27B
+      device: cuda:0
+    - name: google/gemma-4-31B-it
+      device: cuda:1
+      attn_implementation: sdpa
+  top_k: 2
+  router:
+    encoder: microsoft/deberta-v3-base
+    encoder_max_length: 512
+    hidden_size: 768
+    temperature: 1.0
+    dropout: 0.1
+    gumbel_noise: true
+  interaction:
+    num_layers: 8
+    shared_dim: 2048
+    num_heads: 8
+    dropout: 0.1
+    placement: uniform
+    cross_attention: true
+    norm: true
+    rope: true
+    time_scale: 2.0            # ~2 characters per token in the digit-grid format
+    expert_bias: true
+    ffn: true
+    ffn_mult: 2.0
+    symmetric: true
+    num_registers: 4
+    loops: 2
+  dtype: bfloat16
+  attn_implementation: kernels-community/flash-attn2
+  main_device: cuda:1
+  gradient_checkpointing: true
+  compile: false
+
+train:
+  data: data/arc/train.jsonl
+  output_dir: runs/arc_agi1
+  log_file: logs/arc_agi1.log
+  wandb:
+    project: mot-arc-agi1
+    name: arc_agi1_loops2
+    mode: online
+  epochs: 1
+  batch_size: 1
+  grad_accum: 8
+  lr: 2.0e-4
+  weight_decay: 0.01
+  scheduler: cosine_with_min_lr
+  min_lr_ratio: 0.1
+  warmup_steps: 20
+  grad_clip: 1.0
+  max_length: 8192
+  group_by_length: true
+  seed: 42
+  log_every: 5
+  save_every: 50
+  num_workers: 2
+  resume: null
+  deepspeed: null
+  optim:
+    name: muon
+    muon_lr: null
+    momentum: 0.95
+    nesterov: true
+    ns_steps: 5
+    adjust_lr: match_rms_adamw
+    betas: [0.9, 0.95]
+    eps: 1e-8
+  loss:
+    routing: ce
+    routing_weight: 1.0
+    peer_lm_weight: 0.1
+    lm_chunk_size: 2048
+    fused_ce: true
+
+generation:
+  max_prompt_length: 16384
+  max_new_tokens: 2048
+  temperature: 0.0
+  top_p: 1.0
+  do_sample: false
+  batch_size: 4

@@ -12,6 +12,7 @@ class ExpertSpec:
     name: str = MISSING
     tokenizer: str | None = None
     device: str | None = None
+    attn_implementation: str | None = None  # overrides model.attn_implementation for this expert
 
 
 @dataclass
@@ -55,6 +56,9 @@ class InteractionConfig:
     symmetric: bool = True
     num_registers: int = 4
     loops: int = 1
+    calibrate: bool = True  # scale each reverse projector by the noise level its expert tolerates (measured once)
+    calibration_target: float = 0.02  # tolerated increase of an expert's own NLL (nats/token) at unit gain
+    calibration_samples: int = 4
 
 
 @dataclass
@@ -109,9 +113,19 @@ class OptimConfig:
 
 
 @dataclass
+class WandbConfig:
+    project: str = "mot"
+    entity: str | None = None
+    name: str | None = None
+    mode: str = "online"  # online | offline | disabled (falls back to offline without an API key)
+
+
+@dataclass
 class TrainConfig:
     data: str = MISSING
     output_dir: str = "runs/default"
+    log_file: str | None = None  # default logs/<run name>.log in the working directory
+    wandb: WandbConfig = field(default_factory=WandbConfig)
     epochs: int = 50
     batch_size: int = 64
     grad_accum: int = 1
@@ -141,6 +155,7 @@ class GenerationConfig:
     top_p: float = 0.9
     do_sample: bool = True
     batch_size: int = 16
+    stop: str | None = None  # stop a sequence once its generated text contains this string (cut from the output)
 
 
 @dataclass
