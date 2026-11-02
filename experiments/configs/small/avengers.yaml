@@ -1,0 +1,81 @@
+# Avengers-harness config for the small pool (four 3-4B experts from four families / tokenizers). Run through
+# experiments/harness.py, which sets experiments.task, router.type and generator.type per method and runs app.py
+# from experiments/data/<split> (relative paths below resolve from there). Served model names are the HF ids.
+experiments:
+  task: math500
+  max_workers: 16
+  mode: full
+  use_http_cache: true
+  cache_dir: ../../results/small/cache
+
+router:
+  type: straight
+  straight_router:
+    model: mot
+  random_router:
+    max_router: 1
+    available_models: &experts
+      - Qwen/Qwen3.5-4B
+      - google/gemma-4-E4B-it
+      - microsoft/Phi-4-mini-instruct
+      - HuggingFaceTB/SmolLM3-3B
+  rank_router:
+    centres_path: ../../results/small/rank/centres.npy
+    rankings_path: ../../results/small/rank/rankings.json
+    mapping_path: ../../results/small/rank/mapping.json
+    normalizer_path: ../../results/small/rank/normalizer.joblib
+    available_models: *experts
+    top_n: 1
+    top_k: 11
+    beta: 3.0
+    default_rank: 999
+    embedding_model: Alibaba-NLP/gte-Qwen2-7B-instruct
+  routerdc_router:
+    encoder_model_path: microsoft/mdeberta-v3-base
+    model_path: ../../results/small/routerdc/best_model.pth
+    max_router: 1
+    similarity_function: cos
+    llm_labels: *experts   # order of mot.yaml experts
+  moa_router:
+    proposers: *experts
+    aggregator: Qwen/Qwen3.5-4B
+
+generator:
+  type: direct
+  direct:
+    temperature: 0.0
+    top_p: 1.0
+  self_consistency:
+    samples: 10
+    temperature: 0.7
+    top_p: 1.0
+  moa:
+    layers: 1
+    number_of_proposers: 4
+    number_of_aggregator: 1
+    temperature: 0.2
+    top_p: 1.0
+    proposer_max_tokens: 2048
+    aggregator_max_tokens: 2048
+
+experts:
+  - name: Qwen/Qwen3.5-4B
+    base_url: http://localhost:8001/v1
+    api_key: EMPTY
+    description: Qwen3.5 4B (hybrid linear/full attention)
+  - name: google/gemma-4-E4B-it
+    base_url: http://localhost:8002/v1
+    api_key: EMPTY
+    description: Gemma 4 E4B instruct (4.5B effective)
+  - name: microsoft/Phi-4-mini-instruct
+    base_url: http://localhost:8003/v1
+    api_key: EMPTY
+    description: Phi-4-mini instruct (3.8B)
+  - name: HuggingFaceTB/SmolLM3-3B
+    base_url: http://localhost:8004/v1
+    api_key: EMPTY
+    description: SmolLM3 3B
+  - name: mot
+    base_url: http://localhost:8010/v1
+    api_key: EMPTY
+    description: MixtureOfThoughts over the four experts above (configs/small/mot.yaml)

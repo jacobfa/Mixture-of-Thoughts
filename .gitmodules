@@ -1,0 +1,6 @@
+[submodule "experiments/baselines/avengers"]
+	path = experiments/baselines/avengers
+	url = https://github.com/ZhangYiqun018/Avengers.git
+[submodule "experiments/baselines/routerdc"]
+	path = experiments/baselines/routerdc
+	url = https://github.com/shuhao02/RouterDC.git

@@ -25,6 +25,7 @@ dev = ["ruff"]
 deepspeed = ["deepspeed>=0.17"]
 liger = ["liger-kernel>=0.5"]
 vllm = ["vllm>=0.10"]
+experiments = ["pyyaml", "openai>=1.0", "scikit-learn", "joblib", "huggingface_hub"]  # plus baselines/avengers/requirements.txt
 
 [tool.setuptools.packages.find]
 include = ["mot*"]
@@ -36,3 +37,6 @@ target-version = "py311"
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
 ignore = ["SIM115", "E501"]  # the formatter owns line length; remaining long lines are log strings
+
+[tool.ruff.lint.isort]
+known-first-party = ["mot", "common"]

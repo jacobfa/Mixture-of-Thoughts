@@ -31,6 +31,8 @@ coverage.xml
 # Model artifacts and experiment output
 outputs/
 runs/
+experiments/results/
+experiments/data/
 logs/
 checkpoints/
 wandb/

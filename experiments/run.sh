@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+# Avengers-protocol comparison of MoT against routing/ensembling baselines on a shared expert pool.
+# POOL is `small` (four 3-4B experts) or `large` (three ~30B experts); see configs/<pool>/.
+#
+#   run.sh setup            patch the harness, install deps, download and split the data
+#   run.sh serve POOL       vLLM endpoints for the experts + embedding model (leave running; --gpus 0,1,2)
+#   run.sh bank POOL        single-expert runs on the calibration split -> bank, MoT data, rank artifacts, RouterDC data
+#   run.sh routerdc POOL    train RouterDC on the bank
+#   run.sh mot POOL         train MoT on the bank
+#   run.sh serve-mot POOL   MoT endpoint (leave running)
+#   run.sh eval POOL        every method on the held-out split
+#   run.sh table POOL       accuracy table
+set -euo pipefail
+ROOT=$(cd "$(dirname "$0")/.." && pwd)
+EXP=$ROOT/experiments
+stage=${1:?usage: run.sh STAGE [POOL] [extra args]}
+pool=${2:-small}
+extra=("${@:3}")
+set -- ${extra[@]+"${extra[@]}"}
+
+case $stage in
+  setup)
+    if ! git -C "$EXP/baselines/avengers" apply --reverse --check ../../patches/avengers.patch 2>/dev/null; then
+      git -C "$EXP/baselines/avengers" apply ../../patches/avengers.patch
+    fi
+    pip install -e "$ROOT[experiments]" -r "$EXP/baselines/avengers/requirements.txt"
+    python "$EXP/split_data.py" ;;
+  serve) python "$EXP/serve_experts.py" --pool "$pool" "$@" ;;
+  bank)
+    python "$EXP/harness.py" --pool "$pool" --split train "$@"
+    python "$EXP/build_bank.py" --pool "$pool" ;;
+  routerdc)
+    out=$EXP/results/$pool/routerdc
+    n=$(python -c 'import json,sys; print(len(json.load(open(sys.argv[1]))))' "$out/train.json")
+    m=$(python -c 'import json,sys; print(len(json.load(open(sys.argv[1]))[0]["scores"]))' "$out/train.json")
+    cd "$EXP/baselines/routerdc"
+    python train_router_mdeberta.py --data_paths "$out/train.json" --test_data_paths "$out/val.json" \
+      --test_data_type probability --training_samples_per_dataset "$n" --top_k 1 --last_k $((m - 1)) \
+      --training_steps 1000 --batch_size 64 --learning_rate 5e-5 --cluster_loss_weight 1 --save_path "$out" ;;
+  mot) python "$ROOT/scripts/train.py" --config "$EXP/configs/$pool/mot.yaml" "$@" ;;
+  serve-mot)
+    python "$ROOT/scripts/serve.py" --config "$EXP/configs/$pool/mot.yaml" \
+      --checkpoint "$EXP/results/$pool/mot/final" --port 8010 "$@" ;;
+  eval) python "$EXP/harness.py" --pool "$pool" --split test "$@" ;;
+  table) python "$EXP/summarize.py" --pool "$pool" ;;
+  *) echo "unknown stage: $stage" >&2; exit 2 ;;
+esac

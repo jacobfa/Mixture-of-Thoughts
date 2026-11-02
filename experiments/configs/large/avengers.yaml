@@ -1,0 +1,74 @@
+# Avengers-harness config for the large pool. Run through experiments/harness.py, which sets experiments.task,
+# router.type and generator.type per method and runs app.py from experiments/data/<split> (relative paths below
+# resolve from there). Served model names are the HF ids; vLLM endpoints come from experiments/serve_experts.py,
+# the mot endpoint from scripts/serve.py.
+experiments:
+  task: math500
+  max_workers: 8
+  mode: full
+  use_http_cache: true
+  cache_dir: ../../results/large/cache
+
+router:
+  type: straight
+  straight_router:
+    model: mot
+  random_router:
+    max_router: 1
+    available_models: [zai-org/GLM-4.7-Flash, Qwen/Qwen3.8-27B, google/gemma-4-31B-it]
+  rank_router:
+    centres_path: ../../results/large/rank/centres.npy
+    rankings_path: ../../results/large/rank/rankings.json
+    mapping_path: ../../results/large/rank/mapping.json
+    normalizer_path: ../../results/large/rank/normalizer.joblib
+    available_models: [zai-org/GLM-4.7-Flash, Qwen/Qwen3.8-27B, google/gemma-4-31B-it]
+    top_n: 1
+    top_k: 11
+    beta: 3.0
+    default_rank: 999
+    embedding_model: Alibaba-NLP/gte-Qwen2-7B-instruct
+  routerdc_router:
+    encoder_model_path: microsoft/mdeberta-v3-base
+    model_path: ../../results/large/routerdc/best_model.pth
+    max_router: 1
+    similarity_function: cos
+    llm_labels: [zai-org/GLM-4.7-Flash, Qwen/Qwen3.8-27B, google/gemma-4-31B-it]   # order of mot.yaml experts
+  moa_router:
+    proposers: [zai-org/GLM-4.7-Flash, Qwen/Qwen3.8-27B, google/gemma-4-31B-it]
+    aggregator: google/gemma-4-31B-it
+
+generator:
+  type: direct
+  direct:
+    temperature: 0.0
+    top_p: 1.0
+  self_consistency:
+    samples: 10
+    temperature: 0.7
+    top_p: 1.0
+  moa:
+    layers: 1
+    number_of_proposers: 3
+    number_of_aggregator: 1
+    temperature: 0.2
+    top_p: 1.0
+    proposer_max_tokens: 2048
+    aggregator_max_tokens: 2048
+
+experts:
+  - name: zai-org/GLM-4.7-Flash
+    base_url: http://localhost:8001/v1
+    api_key: EMPTY
+    description: GLM-4.7-Flash
+  - name: Qwen/Qwen3.8-27B
+    base_url: http://localhost:8002/v1
+    api_key: EMPTY
+    description: Qwen3.8-27B
+  - name: google/gemma-4-31B-it
+    base_url: http://localhost:8003/v1
+    api_key: EMPTY
+    description: Gemma 4 31B instruct
+  - name: mot
+    base_url: http://localhost:8010/v1
+    api_key: EMPTY
+    description: MixtureOfThoughts over the three experts above (configs/large/mot.yaml)

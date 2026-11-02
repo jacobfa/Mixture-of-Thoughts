@@ -1,0 +1,90 @@
+# MoT on the Avengers suite, large pool. Trained on the calibration split bank (experiments/build_bank.py),
+# evaluated by the harness through scripts/serve.py.
+model:
+  experts:
+    - name: zai-org/GLM-4.7-Flash
+      device: cuda:0
+    - name: Qwen/Qwen3.8-27B
+      device: cuda:0
+    - name: google/gemma-4-31B-it
+      device: cuda:1
+      attn_implementation: sdpa
+  top_k: 2
+  router:
+    encoder: dmis-lab/UltraBERT-Embed-150M
+    encoder_max_length: 4096
+    pooling: cls
+    hidden_size: 768
+    temperature: 1.0
+    dropout: 0.1
+    gumbel_noise: true
+  interaction:
+    num_layers: 8
+    shared_dim: 2048
+    num_heads: 8
+    dropout: 0.1
+    placement: uniform
+    cross_attention: true
+    norm: true
+    rope: true
+    time_scale: 4.0
+    expert_bias: true
+    ffn: true
+    ffn_mult: 2.0
+    symmetric: true
+    num_registers: 4
+    loops: 1
+  dtype: bfloat16
+  attn_implementation: kernels-community/flash-attn2
+  main_device: cuda:1
+  gradient_checkpointing: true
+  compile: false
+
+train:
+  data: experiments/results/large/mot/train.jsonl
+  output_dir: experiments/results/large/mot
+  log_file: logs/avengers_large.log
+  wandb:
+    project: mot-avengers
+    name: large_topk2
+    mode: online
+  epochs: 2
+  batch_size: 2
+  grad_accum: 8
+  lr: 2.0e-4
+  weight_decay: 0.01
+  scheduler: cosine_with_min_lr
+  min_lr_ratio: 0.1
+  warmup_steps: 100
+  grad_clip: 1.0
+  max_length: 4096
+  group_by_length: true
+  seed: 42
+  log_every: 10
+  save_every: 250
+  num_workers: 2
+  resume: null
+  deepspeed: null
+  optim:
+    name: muon
+    muon_lr: null
+    momentum: 0.95
+    nesterov: true
+    ns_steps: 5
+    adjust_lr: match_rms_adamw
+    betas: [0.9, 0.95]
+    eps: 1e-8
+  loss:
+    routing: ce
+    routing_weight: 1.0
+    peer_lm_weight: 0.1
+    lm_chunk_size: 2048
+    fused_ce: true
+
+generation:
+  max_prompt_length: 4096
+  max_new_tokens: 2048
+  temperature: 0.0
+  top_p: 1.0
+  do_sample: false
+  batch_size: 8

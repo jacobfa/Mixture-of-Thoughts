@@ -1,0 +1,91 @@
+# MoT on the Avengers suite, small pool: four 3-4B experts with different tokenizers and architectures, one GPU.
+model:
+  experts:
+    - name: Qwen/Qwen3.5-4B
+      device: cuda:0
+    - name: google/gemma-4-E4B-it
+      device: cuda:0
+      attn_implementation: sdpa
+    - name: microsoft/Phi-4-mini-instruct
+      device: cuda:0
+    - name: HuggingFaceTB/SmolLM3-3B
+      device: cuda:0
+  top_k: 2
+  router:
+    encoder: dmis-lab/UltraBERT-Embed-150M
+    encoder_max_length: 4096
+    pooling: cls
+    hidden_size: 768
+    temperature: 1.0
+    dropout: 0.1
+    gumbel_noise: true
+  interaction:
+    num_layers: 8
+    shared_dim: 1024
+    num_heads: 8
+    dropout: 0.1
+    placement: uniform
+    cross_attention: true
+    norm: true
+    rope: true
+    time_scale: 4.0
+    expert_bias: true
+    ffn: true
+    ffn_mult: 2.0
+    symmetric: true
+    num_registers: 4
+    loops: 1
+  dtype: bfloat16
+  attn_implementation: kernels-community/flash-attn2
+  main_device: cuda:0
+  gradient_checkpointing: true
+  compile: false
+
+train:
+  data: experiments/results/small/mot/train.jsonl
+  output_dir: experiments/results/small/mot
+  log_file: logs/avengers_small.log
+  wandb:
+    project: mot-avengers
+    name: small_topk2
+    mode: online
+  epochs: 3
+  batch_size: 4
+  grad_accum: 4
+  lr: 3.0e-4
+  weight_decay: 0.01
+  scheduler: cosine_with_min_lr
+  min_lr_ratio: 0.1
+  warmup_steps: 100
+  grad_clip: 1.0
+  max_length: 4096
+  group_by_length: true
+  seed: 42
+  log_every: 10
+  save_every: 250
+  num_workers: 2
+  resume: null
+  deepspeed: null
+  optim:
+    name: muon
+    muon_lr: null
+    momentum: 0.95
+    nesterov: true
+    ns_steps: 5
+    adjust_lr: match_rms_adamw
+    betas: [0.9, 0.95]
+    eps: 1e-8
+  loss:
+    routing: ce
+    routing_weight: 1.0
+    peer_lm_weight: 0.1
+    lm_chunk_size: 2048
+    fused_ce: true
+
+generation:
+  max_prompt_length: 4096
+  max_new_tokens: 2048
+  temperature: 0.0
+  top_p: 1.0
+  do_sample: false
+  batch_size: 16
