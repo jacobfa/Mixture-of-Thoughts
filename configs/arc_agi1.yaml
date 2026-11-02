@@ -1,6 +1,3 @@
-# ARC-AGI-1 with three frozen experts on 2x B200. GLM + Qwen share cuda:0, Gemma and the trainable
-# router / interaction layers live on cuda:1. Gemma 4's global layers use 512-dim heads, above the
-# FlashAttention-2 limit, so it stays on sdpa.
 model:
   experts:
     - name: zai-org/GLM-4.7-Flash
