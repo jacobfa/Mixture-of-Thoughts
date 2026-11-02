@@ -7,8 +7,9 @@ model:
     - name: meta-llama/Meta-Llama-3-8B
   top_k: 2
   router:
-    encoder: microsoft/deberta-v3-base
-    encoder_max_length: 512
+    encoder: dmis-lab/UltraBERT-Embed-150M   # 32K-context embedding model; transformers>=5.20
+    encoder_max_length: 8192
+    pooling: cls                 # mean | cls | last; match the encoder's embedding recipe
     hidden_size: 768
     temperature: 1.0
     dropout: 0.1
@@ -71,7 +72,7 @@ train:
   loss:
     routing: ce                  # ce | bce | none  (supervised router loss on expert_scores)
     routing_weight: 1.0
-    peer_lm_weight: 0.1          # NLL of peer streams on their own tokenization; 0 -> peers' tail layers are skipped
+    peer_lm_weight: 0.1          # NLL of peer streams on their own tokenization; 0 -> peers skip the lm_head
     lm_chunk_size: 2048          # completion tokens per lm_head + CE chunk
     fused_ce: true               # Liger fused linear-CE when installed (pip install mot[liger])
 

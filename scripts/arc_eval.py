@@ -32,7 +32,7 @@ from mot.tracking import WandbRun, config_dict, configure_logging
 from mot.training import fmt_duration
 
 sys.path.insert(0, str(Path(__file__).parent))
-from arc_data import build_prompt, inverse_transform, parse_grid, parse_prompt, transform, transform_pairs  # noqa: E402
+from arc_data import build_prompt, inverse_transform, parse_grid, parse_prompt, transform, transform_pairs
 
 log = logging.getLogger("arc_eval")
 ARC_EVAL_TASKS, ARC_EVAL_PAIRS = 400, 419
@@ -127,13 +127,16 @@ def main() -> None:
         model_cfg.top_k = 1
         pool = ExpertPool.from_config(model_cfg)
         pool.train(False)
-        generate = lambda prompts, budget: (generate_expert(pool, prompts, budget, gen.max_prompt_length), None, 0)
+
+        def generate(prompts, budget):
+            return generate_expert(pool, prompts, budget, gen.max_prompt_length), None, 0
     else:
         model = MixtureOfThoughts.load(args.checkpoint, cfg.model) if args.checkpoint else MixtureOfThoughts(cfg.model)
         model.eval()
-        generate = lambda prompts, budget: generate_mot(
-            model, prompts, GenerationConfig(**{**config_dict(gen), "max_new_tokens": budget, "do_sample": False, "stop": STOP})
-        )
+
+        def generate(prompts, budget):
+            gen_cfg = GenerationConfig(**{**config_dict(gen), "max_new_tokens": budget, "do_sample": False, "stop": STOP})
+            return generate_mot(model, prompts, gen_cfg)
 
     # attempt a: prompts of the (transformed) task; predictions are mapped back before scoring
     transforms = [0, args.attempt_transform][: args.attempts]
@@ -196,7 +199,9 @@ def main() -> None:
     n_pairs, n_tasks = len(results), len(per_task)
 
     def metrics(n_attempts: int) -> dict:
-        solved = lambda attempts: any(attempts[:n_attempts])
+        def solved(attempts: list[bool]) -> bool:
+            return any(attempts[:n_attempts])
+
         pairs_correct = sum(solved(r) for rs in per_task.values() for r in rs)
         tasks_correct = sum(all(solved(r) for r in rs) for rs in per_task.values())
         task_fraction = sum(sum(solved(r) for r in rs) / len(rs) for rs in per_task.values())

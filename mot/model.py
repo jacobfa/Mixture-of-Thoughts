@@ -49,7 +49,9 @@ class MixtureOfThoughts(nn.Module):
         self.pool = pool if pool is not None else ExpertPool.from_config(cfg)
         self.main_device = torch.device(cfg.main_device if torch.cuda.is_available() else "cpu")
         encoder_dtype = getattr(torch, cfg.dtype) if self.main_device.type == "cuda" else torch.float32
-        self.encoder = PromptEncoder(cfg.router.encoder, cfg.router.encoder_max_length, self.main_device, encoder_dtype)
+        self.encoder = PromptEncoder(
+            cfg.router.encoder, cfg.router.encoder_max_length, self.main_device, encoder_dtype, cfg.router.pooling
+        )
         self.router = Router(
             self.encoder.output_dim,
             cfg.router.hidden_size,
@@ -120,7 +122,7 @@ class MixtureOfThoughts(nn.Module):
     ) -> dict[int, Tensor]:
         """Advance every active expert stream through all segments, interleaving interaction layers (each
         applied `loops` times; `ia_caches[q][i]` caches layer q, pass i). `tail_rows[m]` (CPU long indices)
-        restricts the final segment to those rows; experts with no rows are dropped from the result."""
+        selects the rows returned for expert m; experts with no rows skip the final segment entirely."""
         states = {}
         for m, inp in step.items():
             expert = self.pool[m]
@@ -157,7 +159,7 @@ class MixtureOfThoughts(nn.Module):
         self, batches: dict[int, ExpertBatch], gate: Tensor, with_peers: bool
     ) -> tuple[dict[int, tuple[nn.Module, Tensor, Tensor]], dict[int, tuple[nn.Module, Tensor, Tensor]]]:
         """Run all streams; return (lm_head, normed states, targets) at supervised positions for the primary
-        streams and, if `with_peers`, for the peer streams. Without peers the peers' tail layers are skipped."""
+        streams and, if `with_peers`, for the peer streams."""
         step = {m: StepInputs(b.input_ids, b.attention_mask, b.position_ids, b.time) for m, b in batches.items()}
         tail_rows = None if with_peers else {m: b.primary_ids() for m, b in batches.items()}
         hidden = self._run_stacks(step, batches, gate, tail_rows=tail_rows)
@@ -234,42 +236,48 @@ class MixtureOfThoughts(nn.Module):
         target = self.cfg.interaction.calibration_target if target is None else target
         was_training = self.training
         self.eval()
-        Q, M = len(self.interactions), len(self.pool)
-        gains = torch.ones(Q, M)
-        for m, expert in enumerate(self.pool):
-            active = torch.full((len(prompts), 1), m, dtype=torch.long)
-            batch = build_batches(self.pool, active, prompts, completions, max_length, "right", True)[m].to(expert.device)
-            state = expert.begin(batch.input_ids, batch.attention_mask, batch.position_ids)
-            boundaries = []
-            for q in range(Q):
-                expert.run_segment(state, q)
-                boundaries.append(state.hidden.clone())
-            expert.run_segment(state, Q)
-
-            def nll(hidden_q: Tensor, q: int) -> float:
-                st = replace(state, hidden=hidden_q)
-                for k in range(q + 1, Q + 1):
-                    expert.run_segment(st, k)
-                states, targets = supervised_positions(st.hidden, batch.labels)
-                return lm_loss({m: (expert.lm_head, expert.norm(states), targets)}, fused=False).item()
-
-            base = nll(boundaries[Q - 1], Q - 1)
-            gen = torch.Generator(device=expert.device).manual_seed(seed)
-            for q in range(Q):
-                noise = torch.randn(boundaries[q].shape, generator=gen, device=expert.device, dtype=torch.float32)
-                lo, hi = math.log(1e-5), math.log(10.0)
-                for _ in range(10):
-                    mid = (lo + hi) / 2
-                    perturbed = (boundaries[q].float() + noise * math.exp(mid)).to(boundaries[q].dtype)
-                    if nll(perturbed, q) - base < target:
-                        lo = mid
-                    else:
-                        hi = mid
-                gains[q, m] = math.exp(lo)
-            log.info("calibrated expert %d: base nll %.4f, gains %s", m, base, [f"{g:.2e}" for g in gains[:, m].tolist()])
+        gains = torch.stack(
+            [self._calibrate_expert(m, prompts, completions, max_length, target, seed) for m in range(len(self.pool))], 1
+        )
         for q, layer in enumerate(self.interactions):
             layer.gain.copy_(gains[q].to(layer.gain.device))
         self.train(was_training)
+        return gains
+
+    def _calibrate_expert(
+        self, m: int, prompts: list[str], completions: list[str], max_length: int, target: float, seed: int
+    ) -> Tensor:
+        expert, Q = self.pool[m], len(self.interactions)
+        active = torch.full((len(prompts), 1), m, dtype=torch.long)
+        batch = build_batches(self.pool, active, prompts, completions, max_length, "right", True)[m].to(expert.device)
+        state = expert.begin(batch.input_ids, batch.attention_mask, batch.position_ids)
+        boundaries = []
+        for q in range(Q):
+            expert.run_segment(state, q)
+            boundaries.append(state.hidden.clone())
+
+        def nll(hidden_q: Tensor, q: int) -> float:
+            st = replace(state, hidden=hidden_q)
+            for k in range(q + 1, Q + 1):
+                expert.run_segment(st, k)
+            states, targets = supervised_positions(st.hidden, batch.labels)
+            return lm_loss({m: (expert.lm_head, expert.norm(states), targets)}, fused=False).item()
+
+        base = nll(boundaries[Q - 1], Q - 1)
+        gen = torch.Generator(device=expert.device).manual_seed(seed)
+        gains = torch.ones(Q)
+        for q in range(Q):
+            noise = torch.randn(boundaries[q].shape, generator=gen, device=expert.device, dtype=torch.float32)
+            lo, hi = math.log(1e-5), math.log(10.0)
+            for _ in range(10):
+                mid = (lo + hi) / 2
+                perturbed = (boundaries[q].float() + noise * math.exp(mid)).to(boundaries[q].dtype)
+                if nll(perturbed, q) - base < target:
+                    lo = mid
+                else:
+                    hi = mid
+            gains[q] = math.exp(lo)
+        log.info("calibrated expert %d: base nll %.4f, gains %s", m, base, [f"{g:.2e}" for g in gains.tolist()])
         return gains
 
     # ------------------------------------------------------------------ generation
@@ -290,8 +298,10 @@ class MixtureOfThoughts(nn.Module):
         decision = self.route(prompts)
         batches = self._batches(decision.active, prompts, None, gen.max_prompt_length, "left", add_eos=False)
         base_time = torch.tensor([len(p) for p in prompts], device=dev)
+        stride = max(1, round(self.cfg.interaction.time_scale))  # characters per generated token, as in training
         warpers = self._warpers(gen)
 
+        eos = {m: torch.tensor(self.pool[m].eos_token_ids, device=dev) for m in batches}
         kv_caches = {m: self.pool[m].new_cache() for m in batches}
         ia_caches = None
         if self.cfg.interaction.cross_attention:
@@ -311,34 +321,35 @@ class MixtureOfThoughts(nn.Module):
             steps = t + 1
             tokens = {}
             for m, h in hidden.items():
-                expert, b = self.pool[m], batches[m]
+                expert = self.pool[m]
                 nxt = self._sample(expert.logits(h[:, -1]), warpers).to(dev, non_blocking=True)
-                nxt = torch.where(alive[m], nxt, torch.full_like(nxt, expert.pad_token_id))
-                is_eos = nxt == expert.eos_token_id
-                if gen.stop:
-                    is_eos |= self._stop_hit(expert, prev[m], nxt, gen.stop)
-                    prev[m] = nxt
+                tokens[m] = torch.where(alive[m], nxt, torch.full_like(nxt, expert.pad_token_id))
+            stopped = self._stop_hits(tokens, prev, gen.stop) if gen.stop else {}
+            for m, nxt in tokens.items():
+                b = batches[m]
+                is_eos = torch.isin(nxt, eos[m])
+                if m in stopped:
+                    is_eos |= stopped[m]
                 primary = b.primary_rows
                 rows = b.rows[primary]
                 output[rows, t] = torch.where(done[rows], torch.full_like(rows, -1), nxt[primary])
                 done[rows] |= is_eos[primary]
                 alive[m] &= ~is_eos
-                tokens[m] = nxt[:, None]
             for m in hidden:
                 alive[m] &= ~done[batches[m].rows]
-            # single host sync per step: global stop flag + per-expert liveness
+            # host syncs per step: the stop-string check above (if any) and this global stop flag + liveness read
             flags = torch.stack([done.all(), *(alive[m].any() for m in hidden)]).tolist()
             if flags[0]:
                 break
 
             step = {}
-            for m, live in zip(hidden, flags[1:]):
+            for m, live in zip(hidden, flags[1:], strict=True):
                 if not live:
                     continue
                 b = batches[m]
                 attn_mask[m] = torch.cat([attn_mask[m], torch.ones_like(alive[m][:, None], dtype=attn_mask[m].dtype)], -1)
-                time = torch.where(alive[m], base_time[b.rows] + 1 + t, torch.full_like(base_time[b.rows], PAD_TIME))
-                step[m] = StepInputs(tokens[m], attn_mask[m], next_pos[m][:, None], time[:, None])
+                time = torch.where(alive[m], base_time[b.rows] + 1 + t * stride, torch.full_like(base_time[b.rows], PAD_TIME))
+                step[m] = StepInputs(tokens[m][:, None], attn_mask[m], next_pos[m][:, None], time[:, None])
                 next_pos[m] = next_pos[m] + 1
             hidden = self._run_stacks(step, {m: batches[m] for m in step}, decision.gate, kv_caches, ia_caches)
 
@@ -346,19 +357,25 @@ class MixtureOfThoughts(nn.Module):
         for i, row in enumerate(output[:, :steps].tolist()):
             expert = self.pool[decision.primary[i].item()]
             ids = [tok for tok in row if tok >= 0]
-            if ids and ids[-1] == expert.eos_token_id:
+            if ids and ids[-1] in expert.eos_token_ids:
                 ids = ids[:-1]
             token_ids.append(ids)
             text = expert.tokenizer.decode(ids, skip_special_tokens=True)
             texts.append(text.split(gen.stop)[0] if gen.stop else text)
         return GenerationOutput(texts=texts, token_ids=token_ids, routing=decision, steps=steps)
 
-    @staticmethod
-    def _stop_hit(expert, prev: Tensor, nxt: Tensor, stop: str) -> Tensor:
-        """Rows whose last two tokens decode to text containing `stop`."""
-        decode = expert.tokenizer.decode
-        hits = [stop in decode([tok for tok in pair if tok >= 0]) for pair in torch.stack([prev, nxt], 1).tolist()]
-        return torch.tensor(hits, dtype=torch.bool, device=nxt.device)
+    def _stop_hits(self, tokens: dict[int, Tensor], prev: dict[int, Tensor], stop: str) -> dict[int, Tensor]:
+        """Rows whose last two tokens decode to text containing `stop`; one host sync for all experts."""
+        pairs = torch.cat([torch.stack([prev[m], nxt], 1) for m, nxt in tokens.items()]).tolist()
+        hits, start = {}, 0
+        for m, nxt in tokens.items():
+            decode = self.pool[m].tokenizer.decode
+            rows = pairs[start : start + len(nxt)]
+            start += len(nxt)
+            hit = [stop in decode([tok for tok in pair if tok >= 0]) for pair in rows]
+            hits[m] = torch.tensor(hit, dtype=torch.bool, device=nxt.device)
+            prev[m] = nxt
+        return hits
 
     @staticmethod
     def _warpers(gen: GenerationConfig) -> LogitsProcessorList | None:

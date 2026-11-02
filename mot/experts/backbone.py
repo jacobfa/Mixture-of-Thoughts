@@ -23,7 +23,8 @@ MASK_BUILDERS = {
 
 
 def interaction_boundaries(num_layers: int, num_interactions: int, placement: str) -> list[int]:
-    """Layer indices (exclusive) after which each of the Q interaction layers is applied."""
+    """Layer indices (exclusive) after which each of the Q interaction layers is applied. The placement range is
+    split into Q+1 pieces so the final decoder segment (the tail) always runs after the last interaction."""
     if placement not in PLACEMENTS:
         raise ValueError(f"placement must be one of {PLACEMENTS}, got {placement!r}")
     lo, hi = {
@@ -32,8 +33,8 @@ def interaction_boundaries(num_layers: int, num_interactions: int, placement: st
         "intermediate": (num_layers // 4, 3 * num_layers // 4),
         "deep": (num_layers // 2, num_layers),
     }[placement]
-    bounds = [lo + round((i + 1) * (hi - lo) / num_interactions) for i in range(num_interactions)]
-    if len(set(bounds)) != len(bounds) or bounds[0] <= 0:
+    bounds = [lo + round((i + 1) * (hi - lo) / (num_interactions + 1)) for i in range(num_interactions)]
+    if len(set(bounds)) != len(bounds) or bounds[0] <= 0 or bounds[-1] >= num_layers:
         raise ValueError(f"{num_interactions} interaction layers do not fit in layers [{lo}, {hi})")
     return bounds
 
@@ -112,6 +113,9 @@ class StackedExpert:
         self.vocab_size: int = self.config.vocab_size
         self.pad_token_id: int = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
         self.eos_token_id: int = tokenizer.eos_token_id
+        gen_eos = getattr(getattr(model, "generation_config", None), "eos_token_id", None)
+        gen_eos = [gen_eos] if isinstance(gen_eos, int) else list(gen_eos or [])
+        self.eos_token_ids: list[int] = sorted({self.eos_token_id, *gen_eos})
 
         default_type = "sliding_attention" if getattr(self.config, "sliding_window", None) else "full_attention"
         self.layer_types = list(getattr(self.config, "layer_types", None) or [default_type] * num_layers)

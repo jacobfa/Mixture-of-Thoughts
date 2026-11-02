@@ -162,8 +162,10 @@ class Trainer:
             self.epoch = epoch
             t_epoch = time.perf_counter()
             self.loader.batch_sampler.set_epoch(epoch)
-            for batch in tqdm(self.loader, desc=f"epoch {epoch}", dynamic_ncols=True, disable=not show_bar):
-                self.train_step(batch)
+            skip = self.micro - epoch * len(self.loader)
+            for i, batch in enumerate(tqdm(self.loader, desc=f"epoch {epoch}", dynamic_ncols=True, disable=not show_bar)):
+                if i >= skip:
+                    self.train_step(batch)
             if self.is_main:
                 log.info("epoch %d/%d done in %s", epoch + 1, self.cfg.epochs, fmt_duration(time.perf_counter() - t_epoch))
             self.save_checkpoint(self.out_dir / "latest")
@@ -242,7 +244,7 @@ class Trainer:
         sec_per_step = elapsed / max(done, 1)
         remaining = max(self.total_steps - self.step, 0)
         eta = remaining * sec_per_step
-        record = dict(zip(keys, values))
+        record = dict(zip(keys, values, strict=True))
         record.update(
             step=self.step,
             epoch=self.epoch,
@@ -313,5 +315,5 @@ class Trainer:
             self.scheduler.load_state_dict(state["scheduler"])
         self.step = state["step"]
         self.micro = state.get("micro", self.step * self.cfg.grad_accum)
-        self.epoch = state["epoch"] + 1
-        log.info("resumed from %s at step %d", path, self.step)
+        self.epoch = self.micro // len(self.loader)
+        log.info("resumed from %s at step %d (epoch %d, micro-batch %d)", path, self.step, self.epoch, self.micro)

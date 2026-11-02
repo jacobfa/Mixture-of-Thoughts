@@ -43,7 +43,7 @@ def main() -> None:
     for start in tqdm(range(0, len(order), bs), disable=out is sys.stdout):
         ids = order[start : start + bs]
         result = model.generate([prompts[i] for i in ids], cfg.generation)
-        for i, text, active in zip(ids, result.texts, result.routing.active.tolist()):
+        for i, text, active in zip(ids, result.texts, result.routing.active.tolist(), strict=True):
             results[i] = {"prompt": prompts[i], "completion": text, "experts": active}
     for row in results:
         out.write(json.dumps(row) + "\n")

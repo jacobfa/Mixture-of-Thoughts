@@ -67,8 +67,9 @@ def encode(
     add_eos: bool,
 ) -> tuple[list[Tensor], list[Tensor], list[Tensor] | None]:
     """Tokenize prompt(+completion) and derive per-token alignment coordinates and labels."""
+    supervised = completions is not None
     completions = completions or [""] * len(prompts)
-    texts = [p + c for p, c in zip(prompts, completions)]
+    texts = [p + c for p, c in zip(prompts, completions, strict=True)]
     enc = tokenizer(
         texts,
         add_special_tokens=True,
@@ -79,7 +80,7 @@ def encode(
     )
     ids_out, time_out, labels_out = [], [], []
     for ids, offsets, special, prompt, text in zip(
-        enc["input_ids"], enc["offset_mapping"], enc["special_tokens_mask"], prompts, texts
+        enc["input_ids"], enc["offset_mapping"], enc["special_tokens_mask"], prompts, texts, strict=True
     ):
         ids = torch.tensor(ids, dtype=torch.long)
         offsets = torch.tensor(offsets, dtype=torch.long).view(-1, 2)
@@ -95,7 +96,7 @@ def encode(
         ids_out.append(ids)
         time_out.append(time)
         labels_out.append(labels)
-    return ids_out, time_out, (labels_out if completions is not None else None)
+    return ids_out, time_out, (labels_out if supervised else None)
 
 
 def pad_stack(seqs: list[Tensor], length: int, value: int, side: str) -> Tensor:

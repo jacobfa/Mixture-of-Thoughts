@@ -19,7 +19,7 @@ def default_devices() -> list[str]:
 
 
 def load_causal_lm(name: str, device: str, dtype: torch.dtype, attn_implementation: str) -> PreTrainedModel:
-    kwargs = {"dtype": dtype, "device_map": device, "low_cpu_mem_usage": True}
+    kwargs = {"dtype": dtype, "device_map": device}
     try:
         model = AutoModelForCausalLM.from_pretrained(name, attn_implementation=attn_implementation, **kwargs)
     except Exception as err:  # kernel hub unavailable, CPU-only, unsupported arch, ...

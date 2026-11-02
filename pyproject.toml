@@ -9,7 +9,7 @@ description = "Mixture of Thoughts: latent-space collaboration among frozen hete
 requires-python = ">=3.11"
 dependencies = [
     "torch>=2.6",
-    "transformers>=5.4",
+    "transformers>=5.20",
     "kernels>=0.16,<0.17",  # range accepted by transformers' hub-kernel attention loader
     "accelerate>=1.0",
     "omegaconf>=2.3",
@@ -21,7 +21,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8", "ruff"]
+dev = ["ruff"]
 deepspeed = ["deepspeed>=0.17"]
 liger = ["liger-kernel>=0.5"]
 vllm = ["vllm>=0.10"]
@@ -30,12 +30,9 @@ vllm = ["vllm>=0.10"]
 include = ["mot*"]
 
 [tool.ruff]
-line-length = 110
+line-length = 120
 target-version = "py311"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
-ignore = ["SIM115"]
-
-[tool.pytest.ini_options]
-testpaths = ["tests"]
+ignore = ["SIM115", "E501"]  # the formatter owns line length; remaining long lines are log strings

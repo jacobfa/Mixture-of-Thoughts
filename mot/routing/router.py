@@ -21,10 +21,6 @@ class RoutingDecision:
     def top_k(self) -> int:
         return self.active.shape[1]
 
-    @property
-    def hard(self) -> Tensor:
-        return F.one_hot(self.active, self.scores.shape[1]).sum(1).to(self.scores.dtype)
-
 
 def gumbel_like(x: Tensor, eps: float = 1e-10) -> Tensor:
     u = torch.rand_like(x).clamp(eps, 1 - eps)

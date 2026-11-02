@@ -9,8 +9,9 @@ model:
       attn_implementation: sdpa
   top_k: 2
   router:
-    encoder: microsoft/deberta-v3-base
-    encoder_max_length: 512
+    encoder: dmis-lab/UltraBERT-Embed-150M
+    encoder_max_length: 16384
+    pooling: cls
     hidden_size: 768
     temperature: 1.0
     dropout: 0.1

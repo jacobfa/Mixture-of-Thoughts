@@ -36,7 +36,7 @@ def linear_cross_entropy(lm_head: nn.Module, hidden: Tensor, targets: Tensor, ch
         return _liger_ce(lm_head.weight, hidden.to(lm_head.weight.dtype), targets).float()
     recompute = torch.is_grad_enabled() and hidden.requires_grad and hidden.shape[0] > chunk_size
     total = None
-    for h, t in zip(hidden.split(chunk_size), targets.split(chunk_size)):
+    for h, t in zip(hidden.split(chunk_size), targets.split(chunk_size), strict=True):
         term = checkpoint(_ce_sum, lm_head, h, t, use_reentrant=False) if recompute else _ce_sum(lm_head, h, t)
         total = term if total is None else total + term
     return total

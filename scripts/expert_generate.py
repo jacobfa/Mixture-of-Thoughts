@@ -65,7 +65,7 @@ def main() -> None:
             max_model_len=gen.max_prompt_length + gen.max_new_tokens,
             enable_prefix_caching=True,
         )
-        for row, out in zip(results, llm.generate(prompts, sampling)):
+        for row, out in zip(results, llm.generate(prompts, sampling), strict=True):
             row["completions"][str(m)] = [o.text for o in out.outputs]
         del llm
         gc.collect()

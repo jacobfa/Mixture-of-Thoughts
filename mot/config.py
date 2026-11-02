@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
 
 from omegaconf import MISSING, OmegaConf
 
@@ -17,8 +16,9 @@ class ExpertSpec:
 
 @dataclass
 class RouterConfig:
-    encoder: str = "microsoft/deberta-v3-base"
-    encoder_max_length: int = 512
+    encoder: str = "dmis-lab/UltraBERT-Embed-150M"
+    encoder_max_length: int = 8192
+    pooling: str = "cls"  # mean | cls | last
     hidden_size: int = 768
     temperature: float = 1.0
     dropout: float = 0.1
@@ -84,8 +84,8 @@ class LossConfig:
       - "bce":  independent sigmoid per expert against labels in [0, 1]
       - "none": router learns only through the straight-through LM gradient
     peer_lm_weight: NLL of the non-primary streams on their own tokenization of the completion; anchors peer
-      representations that are otherwise only shaped by what helps the primary. 0 disables it and lets the
-      trainer skip the peers' tail layers entirely.
+      representations that are otherwise only shaped by what helps the primary. 0 disables it and skips the
+      peers' lm_head pass.
     lm_chunk_size: completion tokens per lm_head + cross-entropy chunk (bounds the [N, V] logits buffer)
     fused_ce: use Liger's fused linear-cross-entropy kernel when installed and running on CUDA
     """
@@ -172,7 +172,3 @@ def load_config(path: str | Path | None = None, overrides: list[str] | None = No
     if overrides:
         cfg = OmegaConf.merge(cfg, OmegaConf.from_dotlist(overrides))
     return OmegaConf.to_object(cfg)
-
-
-def to_dict(cfg: Any) -> dict:
-    return OmegaConf.to_container(OmegaConf.structured(cfg), resolve=True)
