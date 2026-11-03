@@ -17,7 +17,7 @@ import torch.nn.functional as F
 from torch import nn
 from transformers import AutoModel, AutoTokenizer
 
-from common import RESULTS, expert_names, load_bank
+from common import RESULTS, Tracker, expert_names, load_bank
 
 ENCODER = "microsoft/mdeberta-v3-base"
 MAX_LENGTH = 512
@@ -91,6 +91,13 @@ def main() -> None:
     tokenizer = tokenizer_for(args.encoder)
     model = ZooterModel(args.encoder, len(experts)).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
+    tracker = Tracker(
+        args.pool,
+        "router",
+        "router/zooter",
+        config={**vars(args), "train_rows": len(questions), "val_rows": len(val_questions)},
+        tags=["zooter"],
+    )
 
     best, step, order = -1.0, 0, []
     while step < args.steps:
@@ -107,12 +114,17 @@ def main() -> None:
         loss.backward()
         optimizer.step()
         step += 1
+        record = {"train/loss": loss.item()}
         if step % args.eval_every == 0 or step == args.steps:
             acc = routed_accuracy(model, tokenizer, val_questions, val_rewards, device, args.batch_size)
+            record["val/routed_accuracy"] = acc
             print(f"step {step}: loss {loss.item():.4f}  val routed acc {acc:.4f}", flush=True)
             if acc > best:
                 best = acc
                 torch.save(model.state_dict(), out / "best_model.pth")
+        tracker.log(record, step=step)
+    tracker.summary({"best_val_routed_accuracy": best})
+    tracker.finish()
 
     meta = {
         "encoder": args.encoder,

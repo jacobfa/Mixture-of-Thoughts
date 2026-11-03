@@ -2,7 +2,8 @@
 
 Accuracy per task with standard errors, ID/OOD/overall means, wins and mean task rank; best single expert and oracle
 rows; token and latency cost; expert-selection distributions and oracle recovery of the routers; query-level paired
-comparison of every method against MoT (McNemar); calibration-bank statistics. The accuracy table is also printed.
+comparison of every method against MoT (McNemar); calibration-bank statistics. The accuracy table is also printed,
+and the tables, per-method metrics and both files are logged to wandb.
 """
 
 import argparse
@@ -11,7 +12,7 @@ import math
 import time
 from collections import Counter, defaultdict
 
-from common import ID_TASKS, MOT, OOD_TASKS, RESULTS, expert_names
+from common import ID_TASKS, MOT, OOD_TASKS, RESULTS, Tracker, expert_names
 
 ORDER = ["random", "rank", "avengers", "routerdc", "zooter", "loraretriever", "moa", MOT]
 ROUTED = ["random", "rank", "avengers", "routerdc", "zooter", "loraretriever"]
@@ -139,6 +140,70 @@ def bank_stats(pool: str, experts: list[str]) -> dict | None:
         "all_solve": sum(all(r.values()) for r in rows) / len(rows),
     }
     return out
+
+
+def track(summary: dict, out) -> None:
+    tasks, experts = summary["tasks"], summary["experts"]
+    tracker = Tracker(
+        summary["pool"],
+        "summary",
+        "summary",
+        config={"tasks": tasks, "n_per_task": summary["n_per_task"]},
+        tags=["summary"],
+    )
+    scalars = {}
+    accuracy, cost, routing = [], [], []
+    for m, e in summary["methods"].items():
+        accuracy.append(
+            [
+                e["label"],
+                *(e["accuracy"].get(t) for t in tasks),
+                *(e["means"][k] for k in ("id", "ood", "all")),
+                e.get("wins"),
+                e.get("mean_rank"),
+            ]
+        )
+        scalars.update({f"{m}/{t}": v for t, v in e["accuracy"].items()})
+        scalars.update({f"{m}/{k}": v for k, v in e["means"].items() if v is not None})
+        for k in ("wins", "mean_rank"):
+            if e.get(k) is not None:
+                scalars[f"{m}/{k}"] = e[k]
+        if "cost" in e:
+            c = e["cost"]
+            cost.append([e["label"], *c.values()])
+            scalars.update({f"{m}/{k}": v for k, v in c.items()})
+        for t, shares in e.get("routing", {}).items():
+            routing.append(
+                [e["label"], t, *(shares[x] for x in experts), e["accuracy"][t], e["oracle_recovery"].get(t)]
+            )
+    tracker.table("accuracy", ["method", *tasks, "id", "ood", "all", "wins", "mean_rank"], accuracy)
+    if cost:
+        tracker.table("cost", ["method", *next(e["cost"] for e in summary["methods"].values() if "cost" in e)], cost)
+    if routing:
+        tracker.table("routing", ["method", "task", *experts, "accuracy", "oracle_recovery"], routing)
+    if summary["pairwise_vs_mot"]:
+        keys = [
+            "tasks",
+            "mot_better",
+            "mot_worse",
+            "tie",
+            "mean_delta",
+            "only_mot_solves",
+            "only_other_solves",
+            "mcnemar_p",
+        ]
+        rows = [[summary["methods"][m]["label"], *(p[k] for k in keys)] for m, p in summary["pairwise_vs_mot"].items()]
+        tracker.table("pairwise_vs_mot", ["method", *keys], rows)
+        scalars.update(
+            {f"vs_mot/{m}/{k}": p[k] for m, p in summary["pairwise_vs_mot"].items() for k in keys if p[k] is not None}
+        )
+    if summary["bank"]:
+        keys = ["n", *experts, "oracle", "all_solve"]
+        tracker.table("bank", ["dataset", *keys], [[d, *(s[k] for k in keys)] for d, s in summary["bank"].items()])
+    tracker.summary(scalars)
+    tracker.save(out / "summary.md")
+    tracker.save(out / "summary.json")
+    tracker.finish()
 
 
 def main() -> None:
@@ -394,6 +459,7 @@ def main() -> None:
         json.dump(summary, f, indent=2, ensure_ascii=False)
     print(md[md.index("## Accuracy") + 2])
     print(f"\nwrote {out / 'summary.md'} and {out / 'summary.json'}")
+    track(summary, out)
 
 
 if __name__ == "__main__":

@@ -1,5 +1,7 @@
 import json
+import os
 from pathlib import Path
+from typing import Any
 
 import yaml
 
@@ -68,3 +70,58 @@ def port_of(base_url: str) -> int:
 
 def slug(method: str) -> str:
     return method.replace("/", "__").replace(":", "-")
+
+
+class Tracker:
+    """wandb run configured by mot.yaml's train.wandb (project, entity, mode); WANDB_MODE overrides the mode and
+    `disabled` makes every call a no-op. Online without an API key falls back to offline."""
+
+    def __init__(self, pool: str, job_type: str, name: str, config: dict | None = None, tags: list[str] | None = None):
+        self.run = None
+        cfg = mot_config(pool)["train"].get("wandb", {})
+        mode = os.environ.get("WANDB_MODE", cfg.get("mode", "online"))
+        if mode == "disabled":
+            return
+        import wandb
+
+        if mode == "online" and not os.environ.get("WANDB_API_KEY"):
+            try:
+                has_key = bool(wandb.api.api_key)
+            except Exception:
+                has_key = False
+            if not has_key:
+                print("no wandb API key found; logging offline (sync later with `wandb sync`)", flush=True)
+                mode = "offline"
+        self.run = wandb.init(
+            project=cfg.get("project", "mot-avengers"),
+            entity=cfg.get("entity"),
+            group=pool,
+            job_type=job_type,
+            name=name,
+            mode=mode,
+            tags=tags,
+            config={"pool": pool, **(config or {})},
+        )
+
+    def log(self, record: dict[str, Any], step: int | None = None) -> None:
+        if self.run is not None:
+            self.run.log(record, step=step)
+
+    def summary(self, values: dict[str, Any]) -> None:
+        if self.run is not None:
+            self.run.summary.update(values)
+
+    def table(self, key: str, columns: list[str], rows: list[list]) -> None:
+        if self.run is not None:
+            import wandb
+
+            self.run.log({key: wandb.Table(columns=columns, data=rows)})
+
+    def save(self, path: Path) -> None:
+        if self.run is not None:
+            self.run.save(str(path), base_path=str(path.parent), policy="now")
+
+    def finish(self) -> None:
+        if self.run is not None:
+            self.run.finish()
+            self.run = None

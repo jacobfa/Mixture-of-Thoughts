@@ -13,6 +13,8 @@
 #   run.sh serve-mot POOL   MoT endpoint (leave running)
 #   run.sh eval POOL        every method on the held-out split, then results/POOL/summary.{md,json}
 #   run.sh table POOL       rebuild the summary from existing results
+# Every stage logs to wandb (project/entity/mode from configs/POOL/mot.yaml train.wandb; WANDB_MODE=offline|disabled
+# overrides). The final summary is also logged as wandb tables.
 set -euo pipefail
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 EXP=$ROOT/experiments
@@ -32,15 +34,7 @@ case $stage in
   bank)
     python "$EXP/harness.py" --pool "$pool" --split train "$@"
     python "$EXP/build_bank.py" --pool "$pool" ;;
-  routerdc)
-    bank=$EXP/results/$pool/bank
-    out=$EXP/results/$pool/routerdc
-    n=$(python -c 'import json,sys; print(len(json.load(open(sys.argv[1]))))' "$bank/train.json")
-    m=$(python -c 'import json,sys; print(len(json.load(open(sys.argv[1]))[0]["scores"]))' "$bank/train.json")
-    cd "$EXP/baselines/routerdc"
-    python train_router_mdeberta.py --data_paths "$bank/train.json" --test_data_paths "$bank/val.json" \
-      --test_data_type probability --training_samples_per_dataset "$n" --top_k 1 --last_k $((m - 1)) \
-      --training_steps 1000 --batch_size 64 --learning_rate 5e-5 --cluster_loss_weight 1 --save_path "$out" ;;
+  routerdc) python "$EXP/routerdc.py" --pool "$pool" "$@" ;;
   zooter) python "$EXP/zooter.py" --pool "$pool" "$@" ;;
   loraretriever) python "$EXP/loraretriever.py" --pool "$pool" "$@" ;;
   routers)

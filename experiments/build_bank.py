@@ -20,7 +20,7 @@ from openai import OpenAI
 from sklearn.cluster import KMeans
 from sklearn.preprocessing import Normalizer
 
-from common import EMBEDDING_URL, RESULTS, expert_names, harness_config, slug
+from common import EMBEDDING_URL, RESULTS, Tracker, expert_names, harness_config, slug
 
 
 def load_runs(pool: str, experts: list[str]) -> dict[tuple[str, str], dict[str, tuple[bool, str]]]:
@@ -123,6 +123,24 @@ def main() -> None:
     with open(out / "bank" / "train.json", "w") as f:
         json.dump(rows[n_val:], f, ensure_ascii=False)
     print(f"rank/: {args.clusters} clusters; bank/: {len(rows) - n_val} train / {n_val} val")
+
+    tracker = Tracker(args.pool, "bank", "bank/build", config=vars(args), tags=["bank"])
+    tracker.summary(
+        {
+            "queries": len(keys),
+            "mot_rows": len(mot_rows),
+            "train_rows": len(rows) - n_val,
+            "val_rows": n_val,
+            "oracle_accuracy": len(mot_rows) / len(keys),
+            **{f"expert_accuracy/{m}": sum(runs[k][m][0] for k in keys) / len(keys) for m in experts},
+        }
+    )
+    tracker.table(
+        "clusters",
+        ["cluster", "total", *experts],
+        [[c, r["total"], *(r["scores"][ids[m]]["accuracy"] for m in experts)] for c, r in rankings.items()],
+    )
+    tracker.finish()
 
 
 if __name__ == "__main__":

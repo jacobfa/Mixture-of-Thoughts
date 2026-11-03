@@ -17,7 +17,7 @@ import torch.nn.functional as F
 from torch import nn
 from transformers import AutoModel, AutoTokenizer
 
-from common import RESULTS, expert_names, load_bank
+from common import RESULTS, Tracker, expert_names, load_bank
 
 ENCODER = "BAAI/bge-base-en-v1.5"
 INSTRUCTION = "Represent the sentence for similar task retrieval: "
@@ -107,6 +107,13 @@ def main() -> None:
     tokenizer = AutoTokenizer.from_pretrained(args.encoder)
     model = Encoder(args.encoder, args.pooling).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
+    tracker = Tracker(
+        args.pool,
+        "router",
+        "router/loraretriever",
+        config={**vars(args), "train_rows": len(questions), "val_rows": len(val_questions), "anchors": len(anchors)},
+        tags=["loraretriever"],
+    )
 
     def enc(texts: list[str], grad: bool = False) -> torch.Tensor:
         return encode(model, tokenizer, texts, args.instruction, args.max_length, device, grad=grad)
@@ -138,14 +145,19 @@ def main() -> None:
         loss.backward()
         optimizer.step()
         step += 1
+        record = {"train/loss": loss.item()}
         if step % args.eval_every == 0 or step == args.steps:
             acc, cents = evaluate()
+            record["val/routed_accuracy"] = acc
             print(f"step {step}: loss {loss.item():.4f}  val routed acc {acc:.4f}", flush=True)
             if acc > best:
                 best = acc
                 model.backbone.save_pretrained(out / "encoder")
                 tokenizer.save_pretrained(out / "encoder")
                 np.save(out / "centroids.npy", cents.cpu().numpy())
+        tracker.log(record, step=step)
+    tracker.summary({"best_val_routed_accuracy": best})
+    tracker.finish()
 
     meta = {
         "encoder": args.encoder,

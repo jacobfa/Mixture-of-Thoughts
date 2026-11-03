@@ -11,6 +11,7 @@ loraretriever     LoraRetriever selection + direct (loraretriever.py)
 moa               Mixture-of-Agents: every expert proposes, one aggregates
 mot               straight(mot) + direct; scripts/serve.py must be running
 Results land in results/<pool>/<split>/<method>/<generator>/<task>-<timestamp>.json; existing results are skipped.
+Every run is also logged to wandb (project from configs/<pool>/mot.yaml train.wandb; WANDB_MODE=disabled turns it off).
 """
 
 import argparse
@@ -82,7 +83,8 @@ def main() -> None:
             if not args.force and list(save_dir.glob(f"*/{task}-*.json")):
                 print(f"skip {method} / {task}: done", flush=True)
                 continue
-            cfg = apply(base, {**overrides(method), "experiments.task": task, "experiments.cache_dir": str(RESULTS / args.pool / "cache")})
+            run_info = {"experiments.pool": args.pool, "experiments.split": args.split, "experiments.method": method}
+            cfg = apply(base, {**overrides(method), **run_info, "experiments.task": task, "experiments.cache_dir": str(RESULTS / args.pool / "cache")})
             cfg_path = out_root / "configs" / f"{slug(method)}-{task}.yaml"
             with open(cfg_path, "w") as f:
                 yaml.safe_dump(cfg, f, sort_keys=False)

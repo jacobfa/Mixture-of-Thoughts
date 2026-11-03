@@ -1,4 +1,5 @@
-"""baselines/avengers/app.py with the Zooter and LoraRetriever routers registered (router.type: zooter | loraretriever)."""
+"""baselines/avengers/app.py with the Zooter and LoraRetriever routers registered (router.type: zooter | loraretriever)
+and every finished run logged to wandb."""
 
 import argparse
 import json
@@ -9,7 +10,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from common import AVENGERS
+from common import AVENGERS, Tracker
 
 sys.path.insert(0, str(AVENGERS))
 
@@ -87,9 +88,58 @@ def create_router(normal_experts, thinking_experts, router_config):
 factory.RouterFactory.create_router = staticmethod(create_router)
 
 
+def track(config: dict, results: dict) -> None:
+    exp = config["experiments"]
+    pool, split, method, task = (
+        exp.get("pool", "unknown"),
+        exp.get("split", "test"),
+        exp.get("method", config["router"]["type"]),
+        exp["task"],
+    )
+    tracker = Tracker(
+        pool,
+        job_type="eval" if split == "test" else "bank",
+        name=f"{split}/{method}/{task}",
+        config={
+            "split": split,
+            "method": method,
+            "task": task,
+            "router": config["router"]["type"],
+            "generator": config["generator"],
+        },
+        tags=[split, method, task],
+    )
+    records = results["records"]
+    n = len(records)
+    tracker.summary(
+        {
+            "accuracy": results["performance"],
+            "queries": n,
+            "correct": sum(bool(r["is_correct"]) for r in records),
+            "prompt_tokens": results["prompt_tokens"],
+            "completion_tokens": results["completion_tokens"],
+            "prompt_tokens_per_query": results["prompt_tokens"] / n,
+            "completion_tokens_per_query": results["completion_tokens"] / n,
+            "time_taken": results["time_taken"],
+            "seconds_per_query": results["time_taken"] / n,
+            "failed_generations": sum(any(o == "failed to generate" for o in r["raw_output"]) for r in records),
+        }
+    )
+    tracker.table(
+        "records",
+        ["index", "model", "is_correct", "prediction", "answer"],
+        [
+            [r["index"], str(r["model_name"]), bool(r["is_correct"]), str(r.get("prediction")), str(r.get("answer"))]
+            for r in records
+        ],
+    )
+    tracker.finish()
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", required=True)
     parser.add_argument("--save_dir", default="results")
     args = parser.parse_args()
-    app.run_experiment(load_config(args.config), args.save_dir)
+    config = load_config(args.config)
+    track(config, app.run_experiment(config, args.save_dir))
