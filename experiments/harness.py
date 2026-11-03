@@ -1,4 +1,4 @@
-"""Run the Avengers harness (baselines/avengers/app.py) over our split for one pool.
+"""Run the Avengers harness (harness_app.py -> baselines/avengers/app.py) over our split for one pool.
 
 method            router + generator
 expert:<name>     straight(name) + direct   one expert alone; on the train split these runs are the sample bank
@@ -6,6 +6,8 @@ random            random + direct
 rank              Avengers router, one greedy sample (compute-matched to a single expert and to MoT)
 avengers          Avengers router + self-consistency@10, T=0.7 (the published configuration)
 routerdc          RouterDC + direct
+zooter            Zooter + direct (zooter.py)
+loraretriever     LoraRetriever selection + direct (loraretriever.py)
 moa               Mixture-of-Agents: every expert proposes, one aggregates
 mot               straight(mot) + direct; scripts/serve.py must be running
 Results land in results/<pool>/<split>/<method>/<generator>/<task>-<timestamp>.json; existing results are skipped.
@@ -19,17 +21,19 @@ import sys
 
 import yaml
 
-from common import AVENGERS, DATA, EMBEDDING_URL, ID_TASKS, MOT, OOD_TASKS, RESULTS, harness_config, slug
+from common import DATA, EMBEDDING_URL, EXP, ID_TASKS, MOT, OOD_TASKS, RESULTS, harness_config, slug
 
 METHODS = {
     "random": {"router.type": "random", "generator.type": "direct"},
     "rank": {"router.type": "rank", "generator.type": "direct"},
     "avengers": {"router.type": "rank", "generator.type": "self_consistency"},
     "routerdc": {"router.type": "routerdc", "generator.type": "direct"},
+    "zooter": {"router.type": "zooter", "generator.type": "direct"},
+    "loraretriever": {"router.type": "loraretriever", "generator.type": "direct"},
     "moa": {"router.type": "moa", "generator.type": "moa"},
     MOT: {"router.type": "straight", "router.straight_router.model": MOT, "generator.type": "direct"},
 }
-EVAL_METHODS = ["experts", "random", "rank", "avengers", "routerdc", "moa", MOT]
+EVAL_METHODS = ["experts", "random", "rank", "avengers", "routerdc", "zooter", "loraretriever", "moa", MOT]
 
 
 def overrides(method: str) -> dict:
@@ -83,7 +87,7 @@ def main() -> None:
             with open(cfg_path, "w") as f:
                 yaml.safe_dump(cfg, f, sort_keys=False)
             print(f"run {method} / {task}", flush=True)
-            cmd = [sys.executable, str(AVENGERS / "app.py"), "--config", str(cfg_path), "--save_dir", str(save_dir)]
+            cmd = [sys.executable, str(EXP / "harness_app.py"), "--config", str(cfg_path), "--save_dir", str(save_dir)]
             if subprocess.run(cmd, cwd=DATA / args.split, env=env, check=False).returncode != 0:
                 print(f"FAILED {method} / {task}", file=sys.stderr, flush=True)
 

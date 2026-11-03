@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 
 import yaml
@@ -52,6 +53,13 @@ def mot_config(pool: str) -> dict:
 def expert_names(pool: str) -> list[str]:
     """Served model names of the pool's experts (HF ids), in MoT expert order."""
     return [e["name"] for e in mot_config(pool)["model"]["experts"]]
+
+
+def load_bank(pool: str, split: str, experts: list[str]) -> tuple[list[str], list[float], list[dict]]:
+    """Router training rows written by build_bank.py: questions, 0/1 rewards in `experts` order, raw rows."""
+    with open(RESULTS / pool / "bank" / f"{split}.json") as f:
+        rows = json.load(f)
+    return [r["question"] for r in rows], [[r["scores"][m] for m in experts] for r in rows], rows
 
 
 def port_of(base_url: str) -> int:

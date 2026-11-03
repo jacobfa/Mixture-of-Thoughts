@@ -33,6 +33,10 @@ router:
     max_router: 1
     similarity_function: cos
     llm_labels: [zai-org/GLM-4.7-Flash, Qwen/Qwen3.8-27B, google/gemma-4-31B-it]   # order of mot.yaml experts
+  zooter_router:
+    model_dir: ../../results/large/zooter
+  loraretriever_router:
+    model_dir: ../../results/large/loraretriever
   moa_router:
     proposers: [zai-org/GLM-4.7-Flash, Qwen/Qwen3.8-27B, google/gemma-4-31B-it]
     aggregator: google/gemma-4-31B-it

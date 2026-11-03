@@ -1,10 +1,11 @@
 """Turn the single-expert runs on the train split into everything the routed methods are fitted on.
 
-results/<pool>/bank.jsonl              {"query", "dataset", "records": {expert: solved}}
+results/<pool>/bank.jsonl              {"query", "dataset", "cluster", "records": {expert: solved}}
 results/<pool>/mot/train.jsonl         MoT rows: prompt, one correct expert's completion, 0/1 expert_scores
 results/<pool>/rank/                   Avengers rank-router artifacts: l2-normalised gte embeddings, K-means centres,
                                        per-cluster accuracy rankings, M01.. mapping (same recipe as generate_rank_router.py)
-results/<pool>/routerdc/{train,val}.json   RouterDC training files: {"question", "scores", "cluster_id"}
+results/<pool>/bank/{train,val}.json   router training files shared by RouterDC, Zooter and LoraRetriever:
+                                       {"question", "dataset", "scores": {expert: 0/1}, "cluster_id"}
 """
 
 import argparse
@@ -57,7 +58,7 @@ def main() -> None:
     parser.add_argument("--pool", required=True)
     parser.add_argument("--clusters", type=int, default=64)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--val-size", type=float, default=0.1, help="RouterDC model-selection split of the bank")
+    parser.add_argument("--val-size", type=float, default=0.1, help="model-selection split of the router training files")
     args = parser.parse_args()
     rng = random.Random(args.seed)
     experts = expert_names(args.pool)
@@ -65,8 +66,17 @@ def main() -> None:
     runs = load_runs(args.pool, experts)
     keys = sorted(runs)
 
+    embedding_model = harness_config(args.pool)["router"]["rank_router"]["embedding_model"]
+    normalizer = Normalizer(norm="l2")
+    vectors = normalizer.fit_transform(embed([q for _, q in keys], embedding_model))
+    kmeans = KMeans(args.clusters, init="k-means++", n_init="auto", max_iter=1000, algorithm="elkan", random_state=args.seed)
+    labels = kmeans.fit_predict(vectors)
+
     ids = {name: f"M{i + 1:02d}" for i, name in enumerate(experts)}
-    bank = [{"query": q, "dataset": task, "records": {m: runs[(task, q)][m][0] for m in experts}} for task, q in keys]
+    bank = [
+        {"query": q, "dataset": task, "cluster": int(label), "records": {m: runs[(task, q)][m][0] for m in experts}}
+        for (task, q), label in zip(keys, labels, strict=True)
+    ]
     write_jsonl(out / "bank.jsonl", bank)
 
     mot_rows = []
@@ -77,12 +87,6 @@ def main() -> None:
             mot_rows.append({"prompt": q, "completion": completion, "expert_scores": [float(m in solved) for m in experts]})
     write_jsonl(out / "mot" / "train.jsonl", mot_rows)
     print(f"mot/train.jsonl: {len(mot_rows)} rows ({len(keys) - len(mot_rows)} unsolved by every expert)")
-
-    embedding_model = harness_config(args.pool)["router"]["rank_router"]["embedding_model"]
-    normalizer = Normalizer(norm="l2")
-    vectors = normalizer.fit_transform(embed([q for _, q in keys], embedding_model))
-    kmeans = KMeans(args.clusters, init="k-means++", n_init="auto", max_iter=1000, algorithm="elkan", random_state=args.seed)
-    labels = kmeans.fit_predict(vectors)
 
     rankings = {}
     for c in range(args.clusters):
@@ -102,18 +106,23 @@ def main() -> None:
     with open(rank_dir / "mapping.json", "w") as f:
         json.dump({i: m for m, i in ids.items()}, f, indent=2)
 
-    dc = [
-        {"question": q, "scores": {m: float(runs[(task, q)][m][0]) for m in experts}, "cluster_id": int(label)}
+    rows = [
+        {
+            "question": q,
+            "dataset": task,
+            "scores": {m: float(runs[(task, q)][m][0]) for m in experts},
+            "cluster_id": int(label),
+        }
         for (task, q), label in zip(keys, labels, strict=True)
     ]
-    rng.shuffle(dc)
-    n_val = round(len(dc) * args.val_size)
-    (out / "routerdc").mkdir(parents=True, exist_ok=True)
-    with open(out / "routerdc" / "val.json", "w") as f:
-        json.dump(dc[:n_val], f, ensure_ascii=False)
-    with open(out / "routerdc" / "train.json", "w") as f:
-        json.dump(dc[n_val:], f, ensure_ascii=False)
-    print(f"rank/: {args.clusters} clusters; routerdc/: {len(dc) - n_val} train / {n_val} val")
+    rng.shuffle(rows)
+    n_val = round(len(rows) * args.val_size)
+    (out / "bank").mkdir(parents=True, exist_ok=True)
+    with open(out / "bank" / "val.json", "w") as f:
+        json.dump(rows[:n_val], f, ensure_ascii=False)
+    with open(out / "bank" / "train.json", "w") as f:
+        json.dump(rows[n_val:], f, ensure_ascii=False)
+    print(f"rank/: {args.clusters} clusters; bank/: {len(rows) - n_val} train / {n_val} val")
 
 
 if __name__ == "__main__":
